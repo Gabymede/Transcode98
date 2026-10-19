@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+installer_out/
+ffmpeg/
+*.zip
+venv/
+.venv/
+old_material/
+untitled_*.mp4
+untitled_*.webm
+untitled_*.mkv
+.vscode/
+Thumbs.db
+desktop.ini
