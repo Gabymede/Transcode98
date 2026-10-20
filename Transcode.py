@@ -617,16 +617,29 @@ class TranscodeApp(_BaseTk):
         self.geometry("960x800")
         self.minsize(820, 680)
         self.configure(bg=BG)
-        
-        ICON_PATH = resource_path("wm_4.ico")
-        if os.path.exists(ICON_PATH):
+
+        ICON_ICO_PATH = resource_path("wm_4.ico")
+        ICON_PNG_PATH = resource_path("wm_4.png")
+
+        if sys.platform == "win32" and os.path.exists(ICON_ICO_PATH):
             try:
-                self.iconbitmap(default=ICON_PATH)
-                self.iconbitmap(ICON_PATH)
+                self.iconbitmap(default=ICON_ICO_PATH)
+                self.iconbitmap(ICON_ICO_PATH)
             except Exception as e:
                 print("iconbitmap failed:", e)
-        else:
-            print("icon not found:", ICON_PATH)
+        elif sys.platform != "win32":
+            if os.path.exists(ICON_PNG_PATH):
+                try:
+                    # В Linux используем PNG через iconphoto
+                    icon_img = tk.PhotoImage(file=ICON_PNG_PATH)
+                    self.iconphoto(True, icon_img)
+                    self._icon_img = icon_img  # сохраняем ссылку, чтобы не удалилась сборщиком мусора
+                except Exception as e:
+                    print("iconphoto failed:", e)
+            else:
+                print("Иконка .png не найдена, используется стандартная.")
+                
+        self._running = False
 
         self._running = False
         self._cancel = False
