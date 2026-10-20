@@ -28,3 +28,12 @@
 1. Перейдите в раздел [Releases](https://github.com/Gabymede/Transcode98/releases).
 2. Скачайте файл `Transcode98_Setup.exe`.
 3. Запустите установщик и следуйте инструкциям.
+
+### Для пользователей Linux
+Скачивать Python или FFmpeg не нужно, они уже внутри.
+
+1. Перейдите в раздел [Releases](https://github.com/Gabymede/Transcode98/releases).
+2. Скачайте файл `Transcode98_Linux_x86_64.tar.gz`.
+3. Распакуйте архив в удобную папку:
+   ```bash
+   tar -xzf Transcode98_Linux_x86_64.tar.gz -C ~/Transcode98
