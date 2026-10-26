@@ -96,6 +96,7 @@ jobs:
       - name: Build with PyInstaller
         run: |
           pyinstaller --noconfirm --onedir --windowed --name Transcode98 \
+            --collect-all tkinterdnd2 \
             --add-data "wm_4.png:." \
             --add-binary "ffmpeg/ffmpeg:ffmpeg" \
             --add-binary "ffmpeg/ffprobe:ffmpeg" \

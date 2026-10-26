@@ -16,3 +16,5 @@ untitled_*.mkv
 Thumbs.db
 desktop.ini
 *.exe
+configs.json
+ffcodecs_cache.json
