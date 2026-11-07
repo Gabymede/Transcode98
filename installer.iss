@@ -1,6 +1,6 @@
 [Setup]
 AppName=Transcode 98
-AppVersion=1.1.0
+AppVersion=1.2.0
 DefaultDirName={autopf}\Transcode98
 DefaultGroupName=Transcode 98
 OutputDir=installer_out

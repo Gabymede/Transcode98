@@ -7,17 +7,19 @@ transcode.py — ffmpeg-GUI в стиле Win98 (dark).
 from __future__ import annotations
 
 import ctypes
+import datetime
 import json
 import os
 import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import tkinter as tk
 from ctypes import wintypes
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, font as tkfont, messagebox
 
 # === РЕСУРСЫ И FFMPEG (для работы из исходников и из PyInstaller-сборки) ===
 
@@ -83,6 +85,7 @@ DISABLED_FG = "#777777"
 WARN_FG     = "#e06c6c"   # недопустимое значение в поле
 ACCENT      = "#4d6a99"   # мягкий синий
 GREEN       = "#4dff4d"   # яркий зелёный
+QUEUE_TIME_FG = "#f8f0a6" # цвет времени в списке очереди
 
 FONT_UI   = ("MS Sans Serif", 9)
 FONT_BOLD = ("MS Sans Serif", 9, "bold")
@@ -106,6 +109,11 @@ TARGET_MIN_MB        = 1
 TARGET_SLIDER_MAX_MB = 90
 TARGET_DEFAULT_MB    = 18
 
+QUEUE_DEFAULT_ROWS = 5
+QUEUE_MAX_ROWS = 15
+PAUSE_LABEL = "II  Пауза"
+RESUME_LABEL = "▶  Продолжить"
+
 ARCHIVE_DIR_NAME = "old_material"
 INPUT_GROUP_TITLE = "Входной файл — можно перетащить в окно"
 DROP_HIGHLIGHT_BG = "#26384f"
@@ -125,6 +133,62 @@ if sys.platform == "win32":
     }
     _POPEN_KWARGS["startupinfo"].dwFlags |= subprocess.STARTF_USESHOWWINDOW
     _POPEN_KWARGS["startupinfo"].wShowWindow = subprocess.SW_HIDE
+
+
+# === ПАУЗА ПРОЦЕССА FFMPEG ===
+# На Windows штатного SIGSTOP нет, поэтому используем NtSuspendProcess /
+# NtResumeProcess. Для этого нужен HANDLE с правом PROCESS_SUSPEND_RESUME.
+_PROCESS_SUSPEND_RESUME = 0x0800
+_NTDLL = None
+_KERNEL32 = None
+if sys.platform == "win32":
+    try:
+        _NTDLL = ctypes.WinDLL("ntdll")
+        _KERNEL32 = ctypes.WinDLL("kernel32")
+        _NTDLL.NtSuspendProcess.argtypes = [wintypes.HANDLE]
+        _NTDLL.NtSuspendProcess.restype = ctypes.c_long
+        _NTDLL.NtResumeProcess.argtypes = [wintypes.HANDLE]
+        _NTDLL.NtResumeProcess.restype = ctypes.c_long
+        _KERNEL32.OpenProcess.argtypes = [
+            wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        _KERNEL32.OpenProcess.restype = wintypes.HANDLE
+        _KERNEL32.CloseHandle.argtypes = [wintypes.HANDLE]
+        _KERNEL32.CloseHandle.restype = wintypes.BOOL
+    except Exception:
+        _NTDLL = _KERNEL32 = None
+
+
+def set_process_suspended(proc, suspend: bool) -> bool:
+    """Приостанавливает или возобновляет процесс ffmpeg.
+
+    Возвращает True, если операция выполнена. Процесс мог уже завершиться —
+    это не ошибка, просто возвращаем False.
+    """
+    if proc is None or proc.poll() is not None:
+        return False
+
+    if sys.platform == "win32":
+        if _NTDLL is None or _KERNEL32 is None:
+            return False
+        handle = _KERNEL32.OpenProcess(
+            _PROCESS_SUSPEND_RESUME, False, int(proc.pid))
+        if not handle:
+            return False
+        try:
+            fn = (_NTDLL.NtSuspendProcess if suspend
+                  else _NTDLL.NtResumeProcess)
+            return fn(handle) == 0
+        except Exception:
+            return False
+        finally:
+            _KERNEL32.CloseHandle(handle)
+
+    try:
+        import signal
+        os.kill(proc.pid, signal.SIGSTOP if suspend else signal.SIGCONT)
+        return True
+    except Exception:
+        return False
 
 
 # ============================================================ КОНФИГУРАЦИИ
@@ -507,6 +571,48 @@ DEFAULT_UI_OPTIONS = {
     "fps_enabled": True,
     "ffprobe_enabled": True,
     "log_enabled": True,
+    "queue_enabled": True,
+    "naming_enabled": True,
+    "trim_enabled": True,
+    "subs_enabled": True,
+}
+
+DEFAULT_NAMING_TEMPLATE = "untitled_%random%%random%%random%"
+
+# Настройки новых функций, которые переживают перезапуск. Они не влияют на
+# видимость блоков (для этого есть ui_options), а хранят последние значения.
+DEFAULT_PREFS = {
+    "naming_template": DEFAULT_NAMING_TEMPLATE,
+    "trim_start": "",
+    "trim_start_unit": "сек",
+    "trim_end": "",
+    "trim_end_unit": "сек",
+    "subs_path": "",
+    "subs_mode": "soft",
+    "queue_show_times": True,
+    "archive_dir_mode": "source",
+    "archive_root": "",
+}
+
+TRIM_UNITS = ("сек", "мин", "кадры")
+SUBS_MODE_LABELS = {"soft": "Встроить (soft)", "burn": "Вжечь в видео"}
+SUBS_MODE_KEYS = {v: k for k, v in SUBS_MODE_LABELS.items()}
+
+QUEUE_STATUS_LABELS = {
+    "waiting": "ожидает",
+    "running": "кодируется",
+    "done": "готово",
+    "error": "ошибка",
+    "skipped": "пропущено",
+    "cancelled": "отменено",
+}
+QUEUE_STATUS_COLORS = {
+    "waiting": TEXT_DIM,
+    "running": ACCENT,
+    "done": GREEN,
+    "error": WARN_FG,
+    "skipped": DISABLED_FG,
+    "cancelled": WARN_FG,
 }
 
 
@@ -517,6 +623,46 @@ def _sanitize_ui_options(opts: dict | None) -> dict:
         for key in DEFAULT_UI_OPTIONS:
             if key in opts:
                 out[key] = bool(opts[key])
+    return out
+
+
+def _sanitize_prefs(prefs: dict | None) -> dict:
+    """Приводит сохранённые значения новых функций к валидному виду."""
+    out = dict(DEFAULT_PREFS)
+    if not isinstance(prefs, dict):
+        return out
+
+    template = str(prefs.get("naming_template", out["naming_template"]) or "").strip()
+    out["naming_template"] = template or DEFAULT_NAMING_TEMPLATE
+
+    for key in ("trim_start", "trim_end"):
+        value = prefs.get(key, out[key])
+        out[key] = "" if value is None else str(value).strip()
+
+    for key, default in (("trim_start_unit", out["trim_start_unit"]),
+                         ("trim_end_unit", out["trim_end_unit"])):
+        unit = str(prefs.get(key, default) or default).strip()
+        out[key] = unit if unit in TRIM_UNITS else default
+
+    out["subs_path"] = str(prefs.get("subs_path", "") or "").strip()
+    mode = str(prefs.get("subs_mode", "soft") or "soft").strip().lower()
+    out["subs_mode"] = mode if mode in SUBS_MODE_LABELS else "soft"
+
+    archive_mode = str(
+        prefs.get("archive_dir_mode", out["archive_dir_mode"]) or "source"
+    ).strip().lower()
+    out["archive_dir_mode"] = (
+        archive_mode if archive_mode in ("source", "custom") else "source")
+    out["archive_root"] = str(
+        prefs.get("archive_root", out["archive_root"]) or ""
+    ).strip().strip('"')
+
+    raw_times = prefs.get("queue_show_times", out["queue_show_times"])
+    if isinstance(raw_times, str):
+        out["queue_show_times"] = raw_times.strip().lower() in (
+            "1", "true", "yes", "on")
+    else:
+        out["queue_show_times"] = bool(raw_times)
     return out
 
 
@@ -624,37 +770,84 @@ def load_ui_options() -> dict:
     return dict(DEFAULT_UI_OPTIONS)
 
 
+def _read_config_file() -> dict:
+    """Читает JSON-файл настроек целиком (или пустой словарь)."""
+    path = config_path()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_config_file(data: dict) -> None:
+    """Записывает JSON-файл настроек, сохраняя остальные ключи."""
+    path = config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except Exception as exc:
+        raise OSError(f"Не удалось сохранить конфигурации:\n{exc}") from exc
+
+
 def save_configs(configs: list[dict], ui_options: dict | None = None) -> None:
     """Сохраняет конфигурации (и, опционально, опции GUI) на диск.
 
     Если ui_options не передан, уже сохранённые опции GUI не теряются.
     """
-    path = config_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    # Сохраняем ранее записанные данные (queue, prefs, ui_options), чтобы
+    # не затирать их при сохранении только списка конфигураций.
+    data = _read_config_file()
+    data["version"] = 1
+    data["configs"] = configs
+    if ui_options is not None:
+        data["ui_options"] = _sanitize_ui_options(ui_options)
+    else:
+        data["ui_options"] = _sanitize_ui_options(data.get("ui_options"))
+    _write_config_file(data)
 
-        # Сохраняем ранее записанные данные (например ui_options), чтобы не
-        # затирать их при сохранении только списка конфигураций.
-        data: dict = {}
-        if path.is_file():
-            try:
-                existing = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(existing, dict):
-                    data = existing
-            except Exception:
-                data = {}
 
-        data["version"] = 1
-        data["configs"] = configs
-        if ui_options is not None:
-            data["ui_options"] = _sanitize_ui_options(ui_options)
-        else:
-            data["ui_options"] = _sanitize_ui_options(data.get("ui_options"))
+def load_queue() -> list[str]:
+    """Читает сохранённую очередь (только пути, без статусов)."""
+    raw = _read_config_file().get("queue")
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        path = item.strip()
+        if not path:
+            continue
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
 
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-    except Exception as exc:
-        raise OSError(f"Не удалось сохранить конфигурации:\n{exc}") from exc
+
+def save_queue(paths: list[str]) -> None:
+    """Сохраняет очередь в общий JSON, не трогая конфигурации и опции."""
+    data = _read_config_file()
+    data["queue"] = [str(p) for p in paths]
+    _write_config_file(data)
+
+
+def load_prefs() -> dict:
+    """Читает последние значения новых функций (шаблон, trim, титры)."""
+    return _sanitize_prefs(_read_config_file().get("prefs"))
+
+
+def save_prefs(prefs: dict) -> None:
+    """Сохраняет значения новых функций, не трогая остальные ключи."""
+    data = _read_config_file()
+    data["prefs"] = _sanitize_prefs(prefs)
+    _write_config_file(data)
 
 
 # ------------------------------------------------------------------- утилиты GUI
@@ -880,6 +1073,221 @@ def _fmt_fps(f: float) -> str:
 
 def _fmt_int(n: int) -> str:
     return f"{n:,}".replace(",", " ")
+
+
+# --------------------------------------------------- имена файлов и шаблоны
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _sanitize_filename_part(name: str) -> str:
+    """Убирает символы, недопустимые в имени файла Windows/Linux."""
+    cleaned = []
+    for ch in str(name):
+        if ch in '<>:"/\\|?*' or ord(ch) < 32:
+            cleaned.append("_")
+        else:
+            cleaned.append(ch)
+    result = "".join(cleaned).strip().rstrip(". ")
+    result = " ".join(result.split())
+    if not result:
+        return "untitled"
+    if result.upper() in _WINDOWS_RESERVED_NAMES:
+        result = "_" + result
+    # Ограничение на длину: длинные шаблоны не должны упираться в лимит пути.
+    if len(result) > 180:
+        result = result[:180].rstrip(". ")
+    return result or "untitled"
+
+
+def _random_digits() -> str:
+    return f"{random.randint(0, 999_999):06d}"
+
+
+def _legacy_output_name(ext: str) -> str:
+    """Прежнее имя по умолчанию: untitled_<18 цифр>.<ext>."""
+    return f"untitled_{_random_digits()}{_random_digits()}{_random_digits()}.{ext}"
+
+
+def _ensure_extension(name: str, ext: str) -> str:
+    suffix = "." + str(ext).lstrip(".")
+    if name.lower().endswith(suffix.lower()):
+        return name
+    return name + suffix
+
+
+def _expand_naming_template(template: str, inp: str, ext: str, cfg: dict,
+                            info: dict | None, index: int = 1) -> str:
+    """Разворачивает шаблон имени файла.
+
+    Подстановки: {name}/{stem}, {ext}, {codec}, {width}, {height}, {fps},
+    {preset}, {date}, {time}, {index}. Плюс %random% — шесть случайных цифр.
+    """
+    template = str(template or "").strip() or DEFAULT_NAMING_TEMPLATE
+    info = info or {}
+    src = Path(inp)
+    fps = float(info.get("fps", 0) or 0)
+    width = int(info.get("width", 0) or 0)
+    height = int(info.get("height", 0) or 0)
+    now = datetime.datetime.now()
+    mapping = {
+        "name": src.stem,
+        "stem": src.stem,
+        "ext": str(ext).lstrip("."),
+        "codec": resolve_vcodec(cfg),
+        "width": str(width) if width > 0 else "",
+        "height": str(height) if height > 0 else "",
+        "fps": _fmt_fps(fps) if fps > 0 else "",
+        "preset": str(cfg.get("name", "") or ""),
+        "date": now.strftime("%Y-%m-%d"),
+        "time": now.strftime("%H-%M-%S"),
+        "index": str(max(1, int(index or 1))),
+    }
+    out = template
+    for key, value in mapping.items():
+        out = out.replace("{" + key + "}", value)
+    while True:
+        pos = out.lower().find("%random%")
+        if pos < 0:
+            break
+        out = out[:pos] + _random_digits() + out[pos + len("%random%"):]
+    return _ensure_extension(_sanitize_filename_part(out), ext)
+
+
+def _unique_output_path(path: str, source: str | None = None) -> str:
+    """Добавляет (1), (2)…, если файл уже существует или совпал с исходником."""
+    p = Path(path)
+    stem, suffix = p.stem, p.suffix
+    source_key = (os.path.normcase(os.path.abspath(source))
+                  if source else None)
+    candidate = p
+    n = 1
+    while True:
+        key = os.path.normcase(os.path.abspath(str(candidate)))
+        if key != source_key and not candidate.exists():
+            return str(candidate)
+        candidate = p.with_name(f"{stem} ({n}){suffix}")
+        n += 1
+
+
+# --------------------------------------------------------------- trim / титры
+
+def _parse_trim_value(raw: str, unit: str, fps: float, label: str) -> float | None:
+    """Переводит значение обрезки в секунды. Пустая строка — «не задано»."""
+    text = str(raw or "").strip().replace(",", ".")
+    if not text:
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"{label}: введите число")
+    if value < 0:
+        raise ValueError(f"{label}: значение не может быть отрицательным")
+    if unit == "мин":
+        value *= 60.0
+    elif unit == "кадры":
+        if fps <= 0:
+            raise ValueError(f"{label}: для кадров нужно знать FPS видео")
+        value /= fps
+    return value
+
+
+def _trim_bounds(start_raw: str, start_unit: str, end_raw: str,
+                 end_unit: str, duration: float, fps: float) -> tuple[float, float | None]:
+    """Возвращает (начало, конец) обрезки в секундах; конец None — до конца."""
+    start = _parse_trim_value(start_raw, start_unit, fps, "начало") or 0.0
+    end = _parse_trim_value(end_raw, end_unit, fps, "конец")
+    if duration > 0:
+        if start >= duration - 0.001:
+            raise ValueError("начало обрезки за пределами видео")
+        if end is not None:
+            end = min(end, duration)
+    if end is not None and end <= start + 0.001:
+        raise ValueError("конец обрезки должен быть позже начала")
+    return start, end
+
+
+def _trimmed_duration(duration: float, start: float,
+                      end: float | None) -> float:
+    if end is not None:
+        return max(0.0, end - start)
+    if duration > 0:
+        return max(0.0, duration - start)
+    return 0.0
+
+
+def _subtitle_filter_expr(path: str) -> str:
+    """Строка фильтра subtitles=… с экранированием пути Windows."""
+    p = os.path.abspath(path).replace("\\", "/")
+    p = p.replace(":", "\\:").replace("'", "\\'")
+    return f"subtitles='{p}'"
+
+
+def _subtitle_codec_for_ext(ext: str) -> str:
+    ext = str(ext or "").lower().lstrip(".")
+    if ext in ("mp4", "m4v", "mov"):
+        return "mov_text"
+    if ext == "webm":
+        return "webvtt"
+    return "copy"
+
+
+def _combine_filters(*parts: str) -> str:
+    return ",".join(p for p in parts if p)
+
+
+_SUBS_COPY_EXTS = (".srt", ".ass", ".ssa", ".vtt", ".sub", ".sup")
+
+
+def _shift_subtitles(path: str, start: float) -> str:
+    """Готовит временную копию субтитров, сдвинутую на start секунд.
+
+    ffmpeg обрезает видео по -ss перед входом, но внешние субтитры при
+    этом остаются на исходной шкале времени. Для обрезки с титрами
+    делаем копию: -ss после входа отбрасывает ранние реплики и
+    пересчитывает время от нуля. Возвращает путь копии или "" — если
+    после начала обрезки реплик не осталось.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    suffix = ext if ext in _SUBS_COPY_EXTS else ".srt"
+    fd, tmp = tempfile.mkstemp(prefix="t98_subs_", suffix=suffix)
+    os.close(fd)
+    if suffix == ext:
+        codec_args = ["-c:s", "copy"]
+    else:
+        # Формат неизвестен — перекодируем в SRT и сдвигаем вручную.
+        codec_args = ["-c:s", "srt",
+                      "-bsf:s", f"setts=pts=PTS-{start:.3f}/TB"]
+    cmd = ["ffmpeg", "-y", "-v", "error", "-i", path,
+           "-ss", f"{start:.3f}", *codec_args, tmp]
+    try:
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", **_POPEN_KWARGS)
+    except OSError as exc:
+        _remove_file(tmp)
+        raise ValueError(f"не удалось подготовить титры: {exc}")
+
+    if res.returncode != 0:
+        _remove_file(tmp)
+        lines = (res.stderr or "").strip().splitlines()
+        detail = f": {lines[-1]}" if lines else ""
+        raise ValueError(f"не удалось подготовить титры{detail}")
+    if os.path.getsize(tmp) <= 0:
+        _remove_file(tmp)
+        return ""
+    return tmp
+
+
+def _remove_file(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def probe_info(path: str) -> dict:
@@ -1258,7 +1666,9 @@ def build_video_args(cfg: dict, quality, two_pass: bool,
         q = str(int(round(float(quality))))
         if vcodec in ("h264_nvenc", "hevc_nvenc", "av1_nvenc"):
             # У NVENC аналог CRF — параметр -cq (в режиме VBR).
-            args += ["-rc", "vbr", "-cq", q]
+            # -b:v 0 отключает целевой битрейт, чтобы качество задавал
+            # только -cq (иначе VBR может упираться в дефолтный битрейт).
+            args += ["-rc", "vbr", "-cq", q, "-b:v", "0"]
         elif vcodec in ("h264_qsv", "hevc_qsv", "av1_qsv"):
             args += ["-global_quality", q]
         elif vcodec in ("h264_amf", "hevc_amf", "av1_amf"):
@@ -1388,10 +1798,20 @@ def _build_advanced_command(text: str, cfg: dict, inp: str, out: str) -> list[st
 
 def build_commands(cfg: dict, inp: str, out: str,
                    quality, two_pass: bool, target_mode: bool = False,
-                   scale_filter: str = "", fps_value: float = 0.0):
+                   scale_filter: str = "", fps_value: float = 0.0,
+                   trim_start: float = 0.0,
+                   trim_duration: float | None = None,
+                   subtitle_file: str = "",
+                   subtitle_codec: str = "copy",
+                   passlog_prefix: str = ""):
     """Строит список команд ffmpeg по выбранной конфигурации.
 
     Возвращает список списков (1 или 2 команды: однопроход/двупроход).
+    trim_start/trim_duration задают обрезку, subtitle_file — внешние
+    субтитры для встраивания (soft). Расширенный лог по-прежнему задаёт
+    команду целиком и игнорирует эти параметры.
+    passlog_prefix — путь к файлам статистики двупрохода (без расширения);
+    если он задан, ffmpeg пишет статистику туда, а не в папку результата.
     """
     null = os.devnull
     advanced = str(cfg.get("advanced_log", "") or "").strip()
@@ -1419,23 +1839,47 @@ def build_commands(cfg: dict, inp: str, out: str,
         # после всех авто-построенных параметров и перед выходным файлом.
         return args + list(cfg.get("raw_args", []))
 
+    def input_part(include_subtitles: bool = True) -> list[str]:
+        args: list[str] = []
+        if trim_start and trim_start > 0:
+            args += ["-ss", f"{trim_start:.3f}"]
+        args += ["-i", inp]
+        if include_subtitles and subtitle_file:
+            args += ["-i", subtitle_file]
+        if trim_duration is not None and trim_duration > 0:
+            args += ["-t", f"{trim_duration:.3f}"]
+        return args
+
+    def subtitle_part() -> list[str]:
+        if not subtitle_file:
+            return []
+        # Явные карты сохраняют прежний выбор «первое видео + первый звук»,
+        # а субтитры берём из второго входа (именно дорожку субтитров).
+        return ["-map", "0:v:0", "-map", "0:a:0?",
+                "-map", "1:s:0", "-c:s", subtitle_codec or "copy"]
+
     if not two_pass:
-        return [["ffmpeg", "-y", "-i", inp, *video_part(), *audio_part(), out]]
+        return [["ffmpeg", "-y", *input_part(), *video_part(),
+                 *audio_part(), *subtitle_part(), out]]
 
     # Двухпроходное кодирование для аппаратных кодеков бессмысленно/не нужно.
     if vcodec in GPU_CODECS:
-        return [["ffmpeg", "-y", "-i", inp, *video_part(), *audio_part(), out]]
+        return [["ffmpeg", "-y", *input_part(), *video_part(),
+                 *audio_part(), *subtitle_part(), out]]
 
-    # Двупроход: для x265 pass через -x265-params, для остальных -pass N
+    # Двупроход. Все программные кодеки (включая libx265 и libsvtav1)
+    # принимают общий флаг ffmpeg -pass; -passlogfile уводит статистику
+    # из папки результата во временную директорию задания.
     def pass_args(n: int) -> list[str]:
-        if vcodec == "libx265":
-            return ["-x265-params", f"pass={n}"]
-        return ["-pass", str(n)]
+        args = ["-pass", str(n)]
+        if passlog_prefix:
+            args += ["-passlogfile", passlog_prefix]
+        return args
 
-    first = ["ffmpeg", "-y", "-i", inp, *video_part(1), *pass_args(1),
-             "-an", "-f", "null", null]
-    second = ["ffmpeg", "-y", "-i", inp, *video_part(2), *pass_args(2),
-              *audio_part(), out]
+    first = ["ffmpeg", "-y", *input_part(include_subtitles=False),
+             *video_part(1), *pass_args(1), "-an", "-f", "null", null]
+    second = ["ffmpeg", "-y", *input_part(), *video_part(2), *pass_args(2),
+              *audio_part(), *subtitle_part(), out]
     return [first, second]
 
 
@@ -1454,10 +1898,10 @@ class SettingsWindow(tk.Toplevel):
     def __init__(self, master: "TranscodeApp"):
         super().__init__(master)
         self.app = master
-        self.title("Настройки — конфигурации и опции GUI")
+        self.title("Настройки — конфигурации, опции и директории")
         self.configure(bg=BG)
-        self.geometry("900x700")
-        self.minsize(780, 600)
+        self.geometry("900x760")
+        self.minsize(780, 620)
         self.transient(master)
         self.grab_set()
 
@@ -1531,6 +1975,14 @@ class SettingsWindow(tk.Toplevel):
             value=bool(self.ui_options.get("ffprobe_enabled", True)))
         self.var_opt_log = tk.BooleanVar(
             value=bool(self.ui_options.get("log_enabled", True)))
+        self.var_opt_queue = tk.BooleanVar(
+            value=bool(self.ui_options.get("queue_enabled", True)))
+        self.var_opt_naming = tk.BooleanVar(
+            value=bool(self.ui_options.get("naming_enabled", True)))
+        self.var_opt_trim = tk.BooleanVar(
+            value=bool(self.ui_options.get("trim_enabled", True)))
+        self.var_opt_subs = tk.BooleanVar(
+            value=bool(self.ui_options.get("subs_enabled", True)))
 
         make_check(gui_body, "Рескейлинг (изменить разрешение)",
                    self.var_opt_rescale).pack(anchor="w", pady=(6, 0))
@@ -1540,6 +1992,57 @@ class SettingsWindow(tk.Toplevel):
                    self.var_opt_ffprobe).pack(anchor="w", pady=(2, 0))
         make_check(gui_body, "Журнал выполнения",
                    self.var_opt_log).pack(anchor="w", pady=(2, 0))
+        make_check(gui_body, "Очередь (пакетная обработка)",
+                   self.var_opt_queue).pack(anchor="w", pady=(2, 0))
+        make_check(gui_body, "Шаблон имени файла",
+                   self.var_opt_naming).pack(anchor="w", pady=(2, 0))
+        make_check(gui_body, "Обрезка видео (trim)",
+                   self.var_opt_trim).pack(anchor="w", pady=(2, 0))
+        make_check(gui_body, "Титры (внешние субтитры)",
+                   self.var_opt_subs).pack(anchor="w", pady=(2, 0))
+
+        dir_group = make_group(left_col, "Директории")
+        dir_group.pack(fill="x", pady=(10, 0))
+        dir_body = tk.Frame(dir_group, bg=BG)
+        dir_body.pack(fill="x", padx=8, pady=8)
+
+        tk.Label(dir_body, text="Куда создавать папку old_material:",
+                 bg=BG, fg=TEXT, font=FONT_UI, anchor="w",
+                 justify="left").pack(fill="x", anchor="w")
+
+        self.var_archive_mode = tk.StringVar(
+            value=str(self.app.archive_dir_mode_var.get() or "source"))
+        self.var_archive_root = tk.StringVar(
+            value=str(self.app.archive_root_var.get() or ""))
+
+        make_radio(
+            dir_body, "Рядом с видео (по умолчанию)",
+            self.var_archive_mode, "source",
+            command=self._on_archive_mode_change,
+        ).pack(anchor="w", pady=(4, 0))
+        make_radio(
+            dir_body, "В указанной папке:",
+            self.var_archive_mode, "custom",
+            command=self._on_archive_mode_change,
+        ).pack(anchor="w", pady=(2, 0))
+
+        archive_row = tk.Frame(dir_body, bg=BG)
+        archive_row.pack(fill="x", pady=(2, 0))
+        self.archive_entry = make_entry(archive_row, self.var_archive_root)
+        self.archive_entry.configure(justify="left")
+        self.archive_entry.pack(side="left", fill="x", expand=True)
+        self.archive_browse_btn = make_button(
+            archive_row, "Обзор…", self._browse_archive_root)
+        self.archive_browse_btn.pack(side="left", padx=(6, 0))
+        tk.Label(
+            dir_body,
+            text=("Внутри выбранной папки будет создана подпапка "
+                  f"{ARCHIVE_DIR_NAME}. Если выбрать саму "
+                  f"{ARCHIVE_DIR_NAME}, она будет использована напрямую."),
+            bg=BG, fg=TEXT_DIM, font=FONT_UI, anchor="w",
+            justify="left", wraplength=300,
+        ).pack(fill="x", anchor="w", pady=(3, 0))
+        self._on_archive_mode_change()
 
         # ---------------------------------------------------------- редактор
         right = make_group(outer, "Редактор")
@@ -2175,6 +2678,64 @@ class SettingsWindow(tk.Toplevel):
         self._delete()
         return "break"
 
+    # --------------------------------------------------- директории
+    def _on_archive_mode_change(self):
+        custom = str(self.var_archive_mode.get() or "source") == "custom"
+        state = "normal" if custom else "disabled"
+        self.archive_entry.configure(state=state)
+        self.archive_browse_btn.configure(state=state)
+
+    def _browse_archive_root(self):
+        current = self.var_archive_root.get().strip().strip('"')
+        initial = current
+        if initial and not os.path.isdir(initial):
+            parent = os.path.dirname(initial)
+            initial = parent if os.path.isdir(parent) else ""
+        kwargs = {
+            "parent": self,
+            "title": "Где создавать папку old_material",
+            "mustexist": False,
+        }
+        if initial:
+            kwargs["initialdir"] = initial
+        path = filedialog.askdirectory(**kwargs)
+        if path:
+            self.var_archive_root.set(os.path.normpath(path))
+            self.var_archive_mode.set("custom")
+            self._on_archive_mode_change()
+
+    def _validated_archive_values(self) -> tuple[str, str] | None:
+        mode = str(self.var_archive_mode.get() or "source").strip().lower()
+        if mode not in ("source", "custom"):
+            mode = "source"
+        root = self.var_archive_root.get().strip().strip('"')
+        if mode == "custom" and not root:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Выберите папку для old_material или режим "
+                "«Рядом с видео».",
+                parent=self)
+            self.archive_entry.focus_set()
+            return None
+        if root:
+            try:
+                root = os.path.abspath(os.path.expandvars(
+                    os.path.expanduser(root)))
+            except (OSError, ValueError):
+                messagebox.showwarning(
+                    APP_TITLE, "Некорректный путь к папке.", parent=self)
+                self.archive_entry.focus_set()
+                return None
+            if os.path.exists(root) and not os.path.isdir(root):
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Указанный путь существует, но это не папка.",
+                    parent=self)
+                self.archive_entry.focus_set()
+                return None
+            self.var_archive_root.set(os.path.normpath(root))
+        return mode, root
+
     # --------------------------------------------------- сохранение
     def _collect_ui_options(self) -> dict:
         return _sanitize_ui_options({
@@ -2182,6 +2743,10 @@ class SettingsWindow(tk.Toplevel):
             "fps_enabled": bool(self.var_opt_fps.get()),
             "ffprobe_enabled": bool(self.var_opt_ffprobe.get()),
             "log_enabled": bool(self.var_opt_log.get()),
+            "queue_enabled": bool(self.var_opt_queue.get()),
+            "naming_enabled": bool(self.var_opt_naming.get()),
+            "trim_enabled": bool(self.var_opt_trim.get()),
+            "subs_enabled": bool(self.var_opt_subs.get()),
         })
 
     def _reset_to_defaults(self):
@@ -2199,6 +2764,10 @@ class SettingsWindow(tk.Toplevel):
         self.var_opt_fps.set(True)
         self.var_opt_ffprobe.set(True)
         self.var_opt_log.set(True)
+        self.var_opt_queue.set(True)
+        self.var_opt_naming.set(True)
+        self.var_opt_trim.set(True)
+        self.var_opt_subs.set(True)
         self.selected_index = 0
         try:
             save_configs(self.configs, ui_options=self.ui_options)
@@ -2218,6 +2787,10 @@ class SettingsWindow(tk.Toplevel):
         # в редакторе теряются при нажатии «Сохранить».
         if self.selected_index is not None and not self._apply_editor():
             return False
+        archive = self._validated_archive_values()
+        if archive is None:
+            return False
+        archive_mode, archive_root = archive
         ui_options = self._collect_ui_options()
         self.ui_options = dict(ui_options)
         try:
@@ -2227,6 +2800,9 @@ class SettingsWindow(tk.Toplevel):
             return False
         self.app.set_configs(self.configs)
         self.app.set_ui_options(ui_options)
+        self.app.archive_dir_mode_var.set(archive_mode)
+        self.app.archive_root_var.set(archive_root)
+        self.app._save_prefs_quiet()
         return True
 
     def _on_close(self):
@@ -2241,7 +2817,7 @@ class TranscodeApp(_BaseTk):
     def __init__(self, initial_file: str | None = None):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("980x830")
+        self.geometry("980x900")
         # Нижнюю границу высоты подгоняет _update_min_height(): она зависит
         # от того, какие панели включены в «Опциях GUI».
         self.minsize(860, 340)
@@ -2269,6 +2845,13 @@ class TranscodeApp(_BaseTk):
 
         self._running = False
         self._cancel = False
+        self._close_when_done = False
+        self._shutting_down = False
+        self._paused = False
+        self._proc_suspended = False
+        self._pause_lock = threading.Lock()
+        self._pause_event = threading.Event()
+        self._pause_event.set()
         self._proc: subprocess.Popen | None = None
         self._duration = 0.0
         self._total_frames = 0
@@ -2281,13 +2864,31 @@ class TranscodeApp(_BaseTk):
         self._last_output: str | None = None
         self._syncing_scale = False
 
+        # Пакетная очередь: пути и статусы хранятся только в памяти,
+        # на диск сохраняются пути (см. load_queue/save_queue).
+        self.queue_items: list[dict] = []
+        self._queue_running = False
+        self._queue_cleanup = False
+        self._queue_info_req = 0
+        self._skip_current = False
+        self._queue_pos = 0
+        self._queue_total = 0
+        self._progress_base = 0.0
+        self._progress_span = 1.0
+
         self._current_status_text = "Готов."
         self._current_status_highlight = None
 
         self.configs: list[dict] = load_configs()
         self.ui_options: dict = load_ui_options()
+        self.prefs: dict = load_prefs()
+        self.archive_dir_mode_var = tk.StringVar(
+            value=str(self.prefs.get("archive_dir_mode", "source")))
+        self.archive_root_var = tk.StringVar(
+            value=str(self.prefs.get("archive_root", "")))
 
         self._build_ui()
+        self._load_queue_from_disk()
         self.apply_ui_options()
 
         self._refresh_codec_menu()
@@ -2325,9 +2926,10 @@ class TranscodeApp(_BaseTk):
         menu = self.codec_menu["menu"]
         menu.delete(0, "end")
         for n in names:
+            # Просто меняем переменную: на ней уже висит trace, который
+            # вызывает _on_codec_change(). Так не нужен приватный tk._setit.
             menu.add_command(label=n,
-                             command=tk._setit(self.codec_var, n,
-                                               self._on_codec_change))
+                             command=lambda v=n: self.codec_var.set(v))
         if self.codec_var.get() not in names and names:
             self.codec_var.set(names[0])
 
@@ -2351,23 +2953,33 @@ class TranscodeApp(_BaseTk):
         fps_on = opts.get("fps_enabled", True)
         ffprobe_on = opts.get("ffprobe_enabled", True)
         log_on = opts.get("log_enabled", True)
+        queue_on = opts.get("queue_enabled", True)
+        naming_on = opts.get("naming_enabled", True)
+        trim_on = opts.get("trim_enabled", True)
+        subs_on = opts.get("subs_enabled", True)
 
-        for w in getattr(self, "_scale_widgets", []):
-            try:
-                if rescale_on:
-                    w.grid()
-                else:
-                    w.grid_remove()
-            except Exception:
-                pass
-        for w in getattr(self, "_fps_widgets", []):
-            try:
-                if fps_on:
-                    w.grid()
-                else:
-                    w.grid_remove()
-            except Exception:
-                pass
+        for widgets, visible in (
+                (getattr(self, "_scale_widgets", []), rescale_on),
+                (getattr(self, "_fps_widgets", []), fps_on),
+                (getattr(self, "_trim_widgets", []), trim_on),
+                (getattr(self, "_subs_widgets", []), subs_on),
+                (getattr(self, "_naming_widgets", []), naming_on)):
+            for w in widgets:
+                try:
+                    if visible:
+                        w.grid()
+                    else:
+                        w.grid_remove()
+                except Exception:
+                    pass
+
+        queue_group = getattr(self, "grp_queue", None)
+        if queue_group is not None:
+            if queue_on:
+                queue_group.pack(fill="x", padx=10, pady=6,
+                                 before=self.grp_params)
+            else:
+                queue_group.pack_forget()
 
         info_frame = getattr(self, "info_frame", None)
         if info_frame is not None:
@@ -2392,7 +3004,14 @@ class TranscodeApp(_BaseTk):
         if not fps_on and self.fps_enabled_var.get():
             self.fps_enabled_var.set(False)
             self._on_fps_toggle()
+        if not trim_on and self.trim_enabled_var.get():
+            self.trim_enabled_var.set(False)
+            self._on_trim_toggle()
+        if not subs_on and self.subs_enabled_var.get():
+            self.subs_enabled_var.set(False)
+            self._on_subs_toggle()
         self._refresh_func_box()
+        self._update_start_label()
 
     def _open_settings(self):
         if self._running:
@@ -2413,8 +3032,94 @@ class TranscodeApp(_BaseTk):
         make_button(self.grp_in, "Обзор…", self._browse).pack(
             side="left", padx=(0, 6), pady=6)
 
-        grp = make_group(self, "Параметры")
-        grp.pack(fill="x", **pad)
+        # ---------- очередь (между входным файлом и параметрами) ----------
+        self.grp_queue = make_group(self, "Очередь")
+        self.grp_queue.pack(fill="x", **pad)
+        queue_body = tk.Frame(self.grp_queue, bg=BG)
+        queue_body.pack(fill="x", padx=6, pady=6)
+
+        queue_list_row = tk.Frame(queue_body, bg=BG)
+        queue_list_row.pack(fill="x")
+        # Text вместо Listbox: только Text умеет красить отдельный
+        # фрагмент строки, поэтому время можно сделать своим цветом.
+        self.queue_list = tk.Text(
+            queue_list_row, height=QUEUE_DEFAULT_ROWS,
+            bg=FIELD_BG, fg=FIELD_FG, selectbackground=ACCENT,
+            selectforeground="#ffffff", inactiveselectbackground=ACCENT,
+            font=FONT_UI, relief="sunken", bd=2, highlightthickness=0,
+            wrap="none", cursor="arrow", insertwidth=0,
+            exportselection=False, takefocus=True,
+        )
+        self.queue_list.pack(side="left", fill="x", expand=True)
+        queue_sb = tk.Scrollbar(
+            queue_list_row, command=self.queue_list.yview,
+            bg=BTN_FACE, activebackground=BTN_FACE_HI,
+            troughcolor=BG_DEEP, relief="raised", bd=2,
+            highlightthickness=0)
+        queue_sb.pack(side="right", fill="y")
+        self.queue_list.configure(yscrollcommand=queue_sb.set)
+        for status, color in QUEUE_STATUS_COLORS.items():
+            self.queue_list.tag_configure(f"q_{status}", foreground=color)
+        self.queue_list.tag_configure("q_time", foreground=QUEUE_TIME_FG)
+        try:
+            self.queue_list.tag_raise("sel")
+        except tk.TclError:
+            pass
+        self.queue_list.configure(state="disabled")
+        self.queue_list.bind("<Button-1>", self._on_queue_click)
+        self.queue_list.bind("<Delete>", self._on_queue_delete)
+        self.queue_list.bind("<Up>", lambda _e: self._queue_move_selection(-1))
+        self.queue_list.bind("<Down>", lambda _e: self._queue_move_selection(1))
+        self.queue_list.bind("<Left>", lambda _e: self._queue_move_selection(-1))
+        self.queue_list.bind("<Right>", lambda _e: self._queue_move_selection(1))
+
+        # Тонкий «грип» под списком: тянем вниз, чтобы увеличить очередь
+        # до 15 строк (втрое больше стандартных пяти).
+        self.queue_resize_grip = tk.Frame(
+            queue_body, bg=BTN_FACE, height=8, bd=1, relief="raised",
+            cursor="sb_v_double_arrow")
+        self.queue_resize_grip.pack(fill="x", pady=(2, 0))
+        self.queue_resize_grip.bind("<ButtonPress-1>",
+                                    self._queue_resize_start)
+        self.queue_resize_grip.bind("<B1-Motion>",
+                                    self._queue_resize_drag)
+        self.queue_resize_grip.bind("<ButtonRelease-1>",
+                                    self._queue_resize_end)
+        self.queue_resize_grip.bind("<Double-Button-1>",
+                                    self._queue_resize_reset)
+
+        qbtns = tk.Frame(queue_body, bg=BG)
+        qbtns.pack(fill="x", pady=(6, 0))
+        self.queue_add_btn = make_button(
+            qbtns, "Добавить…", self._queue_add_dialog)
+        self.queue_add_btn.pack(side="left")
+        self.queue_remove_btn = make_button(
+            qbtns, "Удалить", self._queue_remove_selected)
+        self.queue_remove_btn.pack(side="left", padx=(6, 0))
+        self.queue_clear_btn = make_button(
+            qbtns, "Очистить", self._queue_clear)
+        self.queue_clear_btn.pack(side="left", padx=(6, 0))
+        self.queue_skip_btn = make_button(
+            qbtns, "Пропустить", self._skip_current_job)
+        self.queue_skip_btn.pack(side="left", padx=(6, 0))
+        self.queue_skip_btn.configure(state="disabled")
+
+        self.queue_show_times_var = tk.BooleanVar(
+            value=bool(self.prefs.get("queue_show_times", True)))
+        self.queue_show_times_cb = make_check(
+            qbtns, "Отображать время начала-окончания обработки",
+            self.queue_show_times_var,
+            command=self._on_queue_show_times_toggle)
+        self.queue_show_times_cb.pack(side="left", padx=(12, 0))
+
+        self.queue_info_var = tk.StringVar(value="Очередь пуста")
+        tk.Label(qbtns, textvariable=self.queue_info_var,
+                 bg=BG, fg=TEXT_DIM, font=FONT_UI).pack(side="right")
+
+        self.grp_params = make_group(self, "Параметры")
+        self.grp_params.pack(fill="x", **pad)
+
+        grp = self.grp_params
 
         inner = tk.Frame(grp, bg=BG)
         inner.pack(fill="x", padx=6, pady=6)
@@ -2533,10 +3238,28 @@ class TranscodeApp(_BaseTk):
 
         self.cleanup_var = tk.BooleanVar(value=False)
         self.cleanup_cb = make_check(
-            opts_row, "Исходник → old_material", self.cleanup_var)
+            opts_row, "Исходник → old_material", self.cleanup_var,
+            command=self._on_cleanup_toggle)
         self.cleanup_cb.grid(row=0, column=2, sticky="w", padx=(16, 0))
         self.cleanup_cb.bind("<Enter>", self._on_cleanup_hover)
         self.cleanup_cb.bind("<Leave>", self._on_cleanup_unhover)
+
+        # ---------- дополнительные функции: обрезка и титры ----------
+        extra_opts_row = tk.Frame(left, bg=BG)
+        extra_opts_row.grid(row=7, column=0, columnspan=2,
+                            sticky="w", padx=6, pady=(2, 0))
+
+        self.trim_enabled_var = tk.BooleanVar(value=False)
+        self.trim_cb = make_check(
+            extra_opts_row, "Обрезка", self.trim_enabled_var,
+            command=self._on_trim_toggle)
+        self.trim_cb.grid(row=0, column=0, sticky="w")
+
+        self.subs_enabled_var = tk.BooleanVar(value=False)
+        self.subs_cb = make_check(
+            extra_opts_row, "Титры", self.subs_enabled_var,
+            command=self._on_subs_toggle)
+        self.subs_cb.grid(row=0, column=1, sticky="w", padx=(16, 0))
 
         # ---------- параметры включённых функций ----------
         self.func_box = tk.LabelFrame(
@@ -2544,7 +3267,7 @@ class TranscodeApp(_BaseTk):
             bg=BG, fg=TEXT, relief="groove", bd=2,
             font=FONT_BOLD, labelanchor="nw",
         )
-        self.func_box.grid(row=7, column=0, columnspan=2,
+        self.func_box.grid(row=8, column=0, columnspan=2,
                            sticky="ew", padx=6, pady=(4, 0))
         self.func_box.columnconfigure(0, weight=1)
 
@@ -2590,9 +3313,92 @@ class TranscodeApp(_BaseTk):
         tk.Label(self.fps_ctl, textvariable=self.fps_info_var, bg=BG, fg=TEXT_DIM,
                  font=FONT_UI).pack(side="left")
 
+        # обрезка
+        self.trim_ctl = tk.Frame(self.func_box, bg=BG)
+        self.trim_ctl.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 4))
+        tk.Label(self.trim_ctl, text="Начало:", bg=BG, fg=TEXT_DIM,
+                 font=FONT_UI).pack(side="left")
+        self.trim_start_var = tk.StringVar(
+            value=str(self.prefs.get("trim_start", "")))
+        self.trim_start_entry = make_entry(
+            self.trim_ctl, self.trim_start_var, width=7)
+        self.trim_start_entry.configure(
+            validate="key",
+            validatecommand=(self.register(self._validate_float_entry), "%P"))
+        self.trim_start_entry.pack(side="left", padx=(4, 4))
+        self.trim_start_unit_var = tk.StringVar(
+            value=str(self.prefs.get("trim_start_unit", "сек")))
+        make_option_menu(self.trim_ctl, self.trim_start_unit_var,
+                         TRIM_UNITS, width=6).pack(side="left", padx=(0, 12))
+
+        tk.Label(self.trim_ctl, text="Конец:", bg=BG, fg=TEXT_DIM,
+                 font=FONT_UI).pack(side="left")
+        self.trim_end_var = tk.StringVar(
+            value=str(self.prefs.get("trim_end", "")))
+        self.trim_end_entry = make_entry(
+            self.trim_ctl, self.trim_end_var, width=7)
+        self.trim_end_entry.configure(
+            validate="key",
+            validatecommand=(self.register(self._validate_float_entry), "%P"))
+        self.trim_end_entry.pack(side="left", padx=(4, 4))
+        self.trim_end_unit_var = tk.StringVar(
+            value=str(self.prefs.get("trim_end_unit", "сек")))
+        make_option_menu(self.trim_ctl, self.trim_end_unit_var,
+                         TRIM_UNITS, width=6).pack(side="left", padx=(0, 8))
+        tk.Label(self.trim_ctl, text="пусто — от начала / до конца",
+                 bg=BG, fg=TEXT_DIM, font=FONT_UI).pack(side="left")
+
+        # титры
+        self.subs_ctl = tk.Frame(self.func_box, bg=BG)
+        self.subs_ctl.grid(row=4, column=0, sticky="ew", padx=6, pady=(0, 4))
+        tk.Label(self.subs_ctl, text="Файл:", bg=BG, fg=TEXT_DIM,
+                 font=FONT_UI).pack(side="left")
+        self.subs_path_var = tk.StringVar(
+            value=str(self.prefs.get("subs_path", "")))
+        self.subs_path_entry = make_entry(self.subs_ctl, self.subs_path_var)
+        self.subs_path_entry.configure(justify="left")
+        self.subs_path_entry.pack(side="left", fill="x", expand=True,
+                                  padx=(4, 4))
+        make_button(self.subs_ctl, "Обзор…", self._browse_subtitles).pack(
+            side="left", padx=(0, 8))
+        self.subs_mode_var = tk.StringVar(
+            value=SUBS_MODE_LABELS.get(
+                str(self.prefs.get("subs_mode", "soft")), "Встроить (soft)"))
+        make_option_menu(self.subs_ctl, self.subs_mode_var,
+                         list(SUBS_MODE_LABELS.values()),
+                         width=16).pack(side="left")
+
+        for var in (self.trim_start_var, self.trim_end_var,
+                    self.trim_start_unit_var, self.trim_end_unit_var):
+            var.trace_add("write", self._on_trim_change)
+
         # Виджеты, которые скрываются через «Настройки → Опции GUI».
         self._scale_widgets = [self.scale_cb]
         self._fps_widgets = [self.fps_cb]
+        self._trim_widgets = [self.trim_cb]
+        self._subs_widgets = [self.subs_cb]
+
+        # ---------- шаблон имени файла ----------
+        self.naming_row = tk.Frame(left, bg=BG)
+        self.naming_row.grid(row=9, column=0, columnspan=2,
+                             sticky="ew", padx=6, pady=(4, 0))
+        self.naming_row.columnconfigure(1, weight=1)
+        tk.Label(self.naming_row, text="Шаблон имени:", bg=BG, fg=TEXT_DIM,
+                 font=FONT_UI).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.naming_template_var = tk.StringVar(
+            value=str(self.prefs.get("naming_template",
+                                     DEFAULT_NAMING_TEMPLATE)))
+        self.naming_entry = make_entry(
+            self.naming_row, self.naming_template_var)
+        self.naming_entry.configure(justify="left")
+        self.naming_entry.grid(row=0, column=1, sticky="ew")
+        tk.Label(
+            self.naming_row,
+            text=("Подстановки: {name}, {codec}, {width}, {height}, {fps}, "
+                  "{preset}, {date}, {time}, {index}; %random% — случайные цифры"),
+            bg=BG, fg=TEXT_DIM, font=FONT_UI, anchor="w",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(1, 0))
+        self._naming_widgets = [self.naming_row]
 
         right = tk.LabelFrame(
             inner, text=" Информация о видео ",
@@ -2636,8 +3442,13 @@ class TranscodeApp(_BaseTk):
 
         actions = tk.Frame(self, bg=BG)
         actions.pack(fill="x", **pad)
-        self.start_btn = make_button(actions, "▶  Запустить", self._start, width=14)
+        self.start_btn = make_button(actions, "▶  Запустить", self._start)
         self.start_btn.pack(side="left")
+        self._fit_start_button()
+        self.pause_btn = make_button(actions, PAUSE_LABEL, self._toggle_pause)
+        self.pause_btn.pack(side="left", padx=(8, 0))
+        self.pause_btn.configure(state="disabled")
+        self._fit_pause_button()
         self.cancel_btn = make_button(actions, "■  Отмена", self._cancel_job, width=10)
         self.cancel_btn.pack(side="left", padx=(8, 0))
         self.cancel_btn.configure(state="disabled")
@@ -2788,6 +3599,14 @@ class TranscodeApp(_BaseTk):
                 self.set_status("Идёт транскодирование — дождитесь окончания.")
                 return
             target_file = valid_files[0]
+            if (self.ui_options.get("queue_enabled", True)
+                    and len(valid_files) > 1):
+                self._queue_add_files(valid_files)
+                self._set_input_file(target_file, user_selected=True)
+                self.set_status(f"Добавлено в очередь: {len(valid_files)}")
+                self._log(f"Вставлено файлов из буфера: {len(valid_files)} "
+                          f"→ в очередь.\n")
+                return
             self._set_input_file(target_file, user_selected=True)
             self.set_status(f"Вставлен файл: {os.path.basename(target_file)}")
             self._log(f"Вставлен файл из буфера: {target_file}\n")
@@ -2914,6 +3733,23 @@ class TranscodeApp(_BaseTk):
                 APP_TITLE, "Не удалось распознать файл. Перетащите видеофайл.")
             return "copy"
 
+        # Куда бросили: если в блок очереди — добавляем все файлы туда.
+        drop_on_queue = False
+        w = getattr(event, "widget", None)
+        while w is not None:
+            if w is getattr(self, "grp_queue", None):
+                drop_on_queue = True
+                break
+            w = getattr(w, "master", None)
+
+        queue_on = self.ui_options.get("queue_enabled", True)
+        if queue_on and (drop_on_queue or len(files) > 1):
+            self._queue_add_files(files)
+            self._set_input_file(files[0], user_selected=True)
+            self.set_status(f"Добавлено в очередь: {len(files)}")
+            self._log(f"Перетащено файлов: {len(files)} → в очередь.\n")
+            return "copy"
+
         if len(files) > 1:
             self._log(f"Перетащено файлов: {len(files)}. "
                       f"Взят первый: {files[0]}\n")
@@ -2923,14 +3759,20 @@ class TranscodeApp(_BaseTk):
         self._log(f"Перетащен файл: {files[0]}\n")
         return "copy"
 
+    def _on_cleanup_toggle(self):
+        """Запоминает выбор для рабочего потока очереди.
+
+        Tk-переменные нельзя читать из другого потока, поэтому храним
+        обычный bool и обновляем его в главном потоке.
+        """
+        self._queue_cleanup = bool(self.cleanup_var.get())
+
     def _on_cleanup_hover(self, _event=None):
         if not self._running:
             if "Исходник будет перемещён" not in getattr(self, '_current_status_text', ""):
                 self._prev_hover_text = getattr(self, '_current_status_text', "Готов.")
                 self._prev_hover_highlight = getattr(self, '_current_status_highlight', None)
-            self.set_status(
-                f"Исходник будет перемещён в подпапку {ARCHIVE_DIR_NAME} "
-                f"рядом с исходным видео")
+            self.set_status(self._archive_location_hint())
 
     def _on_cleanup_unhover(self, _event=None):
         if not self._running:
@@ -3039,10 +3881,11 @@ class TranscodeApp(_BaseTk):
                 self.pass_var.set(1)
 
     def _compute_target_bitrate(self) -> float:
-        if self._duration <= 0:
+        duration = self._effective_duration()
+        if duration <= 0:
             return 0.0
         mb = float(self.target_size_var.get())
-        total = mb * MB_TO_MBIT / self._duration
+        total = mb * MB_TO_MBIT / duration
         return max(total - AUDIO_RESERVE_MBIT, 0.1)
 
     def _update_target_label(self):
@@ -3050,14 +3893,16 @@ class TranscodeApp(_BaseTk):
             self.target_info_var.set("")
             return
         mb = self.target_size_var.get()
-        if self._duration <= 0:
+        duration = self._effective_duration()
+        if duration <= 0:
             self.target_info_var.set(
                 f"Цель: {mb} МБ. Нужна длительность — выберите файл.")
             return
         vbr = self._compute_target_bitrate()
+        suffix = " с обрезкой" if duration != self._duration else ""
         self.target_info_var.set(
             f"Цель: {mb} МБ   →   видео ≈ {vbr:.2f} Мбит/с "
-            f"(длительность {_fmt_time(self._duration)})")
+            f"(длительность {_fmt_time(duration)}{suffix})")
 
     # ---------------------------------------------------------- рескейлинг
     def _on_scale_toggle(self):
@@ -3074,14 +3919,20 @@ class TranscodeApp(_BaseTk):
                       and self.scale_enabled_var.get())
         fps_on = (self.ui_options.get("fps_enabled", True)
                   and self.fps_enabled_var.get())
+        trim_on = (self.ui_options.get("trim_enabled", True)
+                   and self.trim_enabled_var.get())
+        subs_on = (self.ui_options.get("subs_enabled", True)
+                   and self.subs_enabled_var.get())
         for widget, visible in ((self.scale_ctl, rescale_on),
                                 (self.scale_preview_label, rescale_on),
-                                (self.fps_ctl, fps_on)):
+                                (self.fps_ctl, fps_on),
+                                (self.trim_ctl, trim_on),
+                                (self.subs_ctl, subs_on)):
             if visible:
                 widget.grid()
             else:
                 widget.grid_remove()
-        if rescale_on or fps_on:
+        if rescale_on or fps_on or trim_on or subs_on:
             self.func_box.grid()
         else:
             self.func_box.grid_remove()
@@ -3150,23 +4001,6 @@ class TranscodeApp(_BaseTk):
         self.scale_preview_var.set(
             f"{self._src_width}×{self._src_height}  →  {w}×{h}")
 
-    def _scale_filter(self) -> str:
-        """Возвращает строку видео-фильтра scale=… или пустую."""
-        if not self.ui_options.get("rescale_enabled", True):
-            return ""
-        if not self.scale_enabled_var.get():
-            return ""
-        size = self._scaled_size()
-        if not size or size[1] <= 0:
-            raise ValueError("укажите корректную высоту для рескейлинга")
-        w, h = size
-        if w > 0:
-            return f"scale={w}:{h}"
-        # ширина неизвестна — масштабируем по высоте с сохранением пропорций
-        if self.scale_keep_aspect_var.get():
-            return f"scale=-2:{h}"
-        return f"scale={h}:{h}"
-
     # ---------------------------------------------------------- понижение FPS
     def _on_fps_toggle(self):
         enabled = self.fps_enabled_var.get()
@@ -3183,22 +4017,52 @@ class TranscodeApp(_BaseTk):
         else:
             self.fps_info_var.set("")
 
-    def _fps_value(self) -> float:
-        if not self.ui_options.get("fps_enabled", True):
-            return 0.0
-        if not self.fps_enabled_var.get():
-            return 0.0
-        raw = self.fps_value_var.get().replace(",", ".").strip()
+    # ---------------------------------------------------------- обрезка / титры
+    def _on_trim_toggle(self):
+        self._refresh_func_box()
+        self._update_target_label()
+
+    def _on_trim_change(self, *_):
+        self._update_target_label()
+
+    def _on_subs_toggle(self):
+        self._refresh_func_box()
+
+    def _browse_subtitles(self):
+        if self._running:
+            self.set_status("Идёт транскодирование — дождитесь окончания.")
+            return
+        current = self.subs_path_var.get().strip()
+        initial_dir = (os.path.dirname(current)
+                       if current and os.path.isfile(current) else None)
+        path = filedialog.askopenfilename(
+            title="Выберите файл субтитров",
+            initialdir=initial_dir,
+            filetypes=[
+                ("Субтитры", "*.srt *.ass *.ssa *.vtt *.sub *.sup"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if path:
+            self.subs_path_var.set(os.path.normpath(path))
+
+    def _subs_mode_key(self) -> str:
+        return SUBS_MODE_KEYS.get(self.subs_mode_var.get().strip(), "soft")
+
+    def _effective_duration(self) -> float:
+        """Длительность с учётом обрезки — для целевого размера и прогресса."""
+        duration = self._duration
+        if not (self.ui_options.get("trim_enabled", True)
+                and self.trim_enabled_var.get()):
+            return duration
         try:
-            v = float(raw)
+            start, end = _trim_bounds(
+                self.trim_start_var.get(), self.trim_start_unit_var.get(),
+                self.trim_end_var.get(), self.trim_end_unit_var.get(),
+                duration, self._src_fps)
         except ValueError:
-            raise ValueError("укажите корректный FPS")
-        if v <= 0:
-            raise ValueError("FPS должен быть больше нуля")
-        if self._src_fps > 0 and v >= self._src_fps - 0.01:
-            raise ValueError("целевой FPS должен быть меньше исходного "
-                             f"({_fmt_fps(self._src_fps)})")
-        return v
+            return duration
+        return _trimmed_duration(duration, start, end)
 
     # ---------------------------------------------------------- информация
     def _reset_info(self):
@@ -3233,6 +4097,8 @@ class TranscodeApp(_BaseTk):
 
     def _on_file_change(self, *_):
         path = self.file_var.get().strip().strip('"')
+        # Отменяем ещё не применённые результаты ffprobe из очереди.
+        self._queue_info_req += 1
         self._duration = 0.0
         self._total_frames = 0
         self._src_width = 0
@@ -3297,31 +4163,436 @@ class TranscodeApp(_BaseTk):
         self.after(0, self._log, text)
 
     def _set_progress(self, frac: float):
+        overall = self._progress_base + self._progress_span * float(frac)
         self.progress_fill.place_configure(
-            relwidth=max(0.0, min(1.0, frac)))
+            relwidth=max(0.0, min(1.0, overall)))
 
-    def _out_path(self, inp: str, ext: str) -> str:
-        p = Path(inp)
-        out_dir = Path(self._output_dir) if self._output_dir else p.parent
-        digits = "".join(f"{random.randint(0, 999_999):06d}" for _ in range(3))
-        return str(out_dir / f"untitled_{digits}.{ext}")
+    # ---------------------------------------------------------- очередь
+    def _load_queue_from_disk(self):
+        paths = load_queue()
+        self.queue_items = [{"path": p, "status": "waiting"} for p in paths]
+        self._queue_refresh_list()
 
-    def _resolve_quality(self):
-        target = self.target_enabled_var.get()
-        cfg = self._current_config()
+    def _queue_paths(self) -> list[str]:
+        return [str(item.get("path", "")) for item in self.queue_items
+                if item.get("path")]
 
-        if target:
-            inp = self.file_var.get().strip().strip('"')
-            if self._duration <= 0 and os.path.isfile(inp):
-                self._duration = probe_info(inp)["duration"]
-            if self._duration <= 0:
+    def _save_queue_quiet(self):
+        try:
+            save_queue(self._queue_paths())
+        except OSError as exc:
+            self._log(f"!!! Не удалось сохранить очередь: {exc}\n")
+
+    def _collect_prefs(self) -> dict:
+        return {
+            "naming_template": (self.naming_template_var.get().strip()
+                                or DEFAULT_NAMING_TEMPLATE),
+            "trim_start": self.trim_start_var.get().strip(),
+            "trim_start_unit": self.trim_start_unit_var.get(),
+            "trim_end": self.trim_end_var.get().strip(),
+            "trim_end_unit": self.trim_end_unit_var.get(),
+            "subs_path": self.subs_path_var.get().strip(),
+            "subs_mode": self._subs_mode_key(),
+            "queue_show_times": bool(self.queue_show_times_var.get()),
+            "archive_dir_mode": self.archive_dir_mode_var.get(),
+            "archive_root": self.archive_root_var.get(),
+        }
+
+    def _save_prefs_quiet(self):
+        self.prefs = _sanitize_prefs(self._collect_prefs())
+        try:
+            save_prefs(self.prefs)
+        except OSError as exc:
+            self._log(f"!!! Не удалось сохранить настройки: {exc}\n")
+
+    def _has_pending_queue(self) -> bool:
+        return any(item.get("status") == "waiting"
+                   for item in self.queue_items)
+
+    def _queue_time_suffix(self, item: dict) -> str:
+        """Добавка с временем начала/окончания, если включено отображение."""
+        var = getattr(self, "queue_show_times_var", None)
+        if var is None:
+            return ""
+        try:
+            if not bool(var.get()):
+                return ""
+        except tk.TclError:
+            return ""
+        started = str(item.get("started_at") or "")
+        if not started:
+            return ""
+        ended = str(item.get("ended_at") or "…")
+        return f"  [{started}–{ended}]"
+
+    def _queue_status_tag(self, status: str) -> str:
+        return f"q_{status}" if status in QUEUE_STATUS_COLORS else "q_waiting"
+
+    def _queue_display(self, index: int) -> str:
+        item = self.queue_items[index]
+        label = QUEUE_STATUS_LABELS.get(item.get("status", "waiting"),
+                                        item.get("status", "waiting"))
+        name = os.path.basename(item.get("path", ""))
+        return f"{index + 1}. [{label}] {name}{self._queue_time_suffix(item)}"
+
+    def _queue_selected_index(self) -> int | None:
+        """Номер выбранного элемента очереди (0-based), если он есть."""
+        try:
+            ranges = self.queue_list.tag_ranges("sel")
+            if not ranges:
+                return None
+            line = int(str(self.queue_list.index(ranges[0])).split(
+                ".", 1)[0]) - 1
+        except (tk.TclError, ValueError):
+            return None
+        return line if 0 <= line < len(self.queue_items) else None
+
+    def _queue_select_index(self, index: int):
+        if not (0 <= index < len(self.queue_items)):
+            return
+        line = index + 1
+        try:
+            self.queue_list.tag_remove("sel", "1.0", "end")
+            self.queue_list.tag_add("sel", f"{line}.0", f"{line}.end")
+            self.queue_list.mark_set("insert", f"{line}.0")
+            self.queue_list.see(f"{line}.0")
+        except tk.TclError:
+            pass
+
+    def _on_queue_click(self, event):
+        try:
+            pos = self.queue_list.index(f"@{event.x},{event.y}")
+            line = int(str(pos).split(".", 1)[0]) - 1
+        except (tk.TclError, ValueError):
+            return "break"
+        self.queue_list.focus_set()
+        if 0 <= line < len(self.queue_items):
+            self._queue_select_index(line)
+            self._on_queue_select()
+        else:
+            try:
+                self.queue_list.tag_remove("sel", "1.0", "end")
+            except tk.TclError:
+                pass
+        return "break"
+
+    def _queue_refresh_list(self, preserve_selection: bool = True):
+        selected = self._queue_selected_index() if preserve_selection else None
+        try:
+            view_top = float(self.queue_list.yview()[0])
+        except (tk.TclError, ValueError, IndexError):
+            view_top = 0.0
+        self.queue_list.configure(state="normal")
+        self.queue_list.delete("1.0", "end")
+        for i, item in enumerate(self.queue_items):
+            status = item.get("status", "waiting")
+            tag = self._queue_status_tag(status)
+            label = QUEUE_STATUS_LABELS.get(status, status)
+            prefix = f"{i + 1}. [{label}] "
+            name = os.path.basename(item.get("path", ""))
+            self.queue_list.insert("end", prefix, tag)
+            self.queue_list.insert("end", name, tag)
+            suffix = self._queue_time_suffix(item)
+            if suffix:
+                self.queue_list.insert("end", suffix, "q_time")
+            self.queue_list.insert("end", "\n")
+        self.queue_list.configure(state="disabled")
+        if selected is not None and selected < len(self.queue_items):
+            self._queue_select_index(selected)
+        else:
+            try:
+                self.queue_list.yview_moveto(view_top)
+            except tk.TclError:
+                pass
+        self._queue_refresh_info()
+        self._update_start_label()
+
+    def _queue_refresh_item(self, index: int):
+        # Перерисовываем весь список: так проще сохранить цвет времени
+        # и не потерять выделение.
+        self._queue_refresh_list()
+
+    def _queue_set_status(self, index: int, status: str,
+                          started_at: str | None = None,
+                          ended_at: str | None = None):
+        if 0 <= index < len(self.queue_items):
+            item = self.queue_items[index]
+            item["status"] = status
+            if started_at is not None:
+                item["started_at"] = started_at
+                item["ended_at"] = None
+            if ended_at is not None:
+                item["ended_at"] = ended_at
+            self._queue_refresh_item(index)
+
+    def _on_queue_show_times_toggle(self):
+        self._queue_refresh_list()
+        self._save_prefs_quiet()
+
+    def _queue_update_path(self, index: int, path: str):
+        """Обновляет путь элемента после переноса исходника в old_material."""
+        if 0 <= index < len(self.queue_items):
+            self.queue_items[index]["path"] = path
+            self._queue_refresh_item(index)
+
+    def _queue_refresh_info(self):
+        total = len(self.queue_items)
+        if total == 0:
+            self.queue_info_var.set("Очередь пуста")
+            return
+        pending = sum(1 for item in self.queue_items
+                      if item.get("status") == "waiting")
+        done = sum(1 for item in self.queue_items
+                   if item.get("status") == "done")
+        self.queue_info_var.set(
+            f"Файлов: {total} • ожидает: {pending} • готово: {done}")
+
+    def _fit_button_width(self, button, longest: str,
+                          min_width: int, fallback: int):
+        """Фиксирует ширину кнопки по самой длинной подписи.
+
+        width у Tk-кнопки считается в символах, а кириллица шире цифры,
+        поэтому фиксированные значения вроде width=14 обрезают текст.
+        """
+        try:
+            f = tkfont.Font(font=button.cget("font"))
+            char_w = max(1, f.measure("0"))
+            button.configure(
+                width=max(min_width, f.measure(longest) // char_w + 2))
+        except tk.TclError:
+            button.configure(width=fallback)
+
+    def _fit_start_button(self):
+        self._fit_button_width(
+            self.start_btn, "▶  Запустить очередь", 14, 34)
+
+    def _fit_pause_button(self):
+        self._fit_button_width(
+            self.pause_btn, RESUME_LABEL, 12, 24)
+
+    def _update_start_label(self):
+        if not hasattr(self, "start_btn"):
+            return
+        queue_on = self.ui_options.get("queue_enabled", True)
+        if queue_on and (self._has_pending_queue() or self._queue_running):
+            self.start_btn.configure(text="▶  Запустить очередь")
+        else:
+            self.start_btn.configure(text="▶  Запустить")
+
+    def _set_queue_controls_state(self, state: str):
+        for btn in (getattr(self, "queue_add_btn", None),
+                    getattr(self, "queue_remove_btn", None),
+                    getattr(self, "queue_clear_btn", None)):
+            if btn is not None:
+                btn.configure(state=state)
+
+    def _queue_add_dialog(self):
+        if self._running:
+            self.set_status("Идёт транскодирование — дождитесь окончания.")
+            return
+        paths = filedialog.askopenfilenames(
+            title="Добавить видео в очередь",
+            filetypes=[
+                ("Видеофайлы", "*.mp4 *.mkv *.mov *.avi *.webm *.m4v *.ts *.flv"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if paths:
+            self._queue_add_files(paths)
+
+    def _queue_add_files(self, paths):
+        existing = {os.path.normcase(os.path.abspath(item.get("path", "")))
+                    for item in self.queue_items}
+        added = 0
+        for raw in paths:
+            path = os.path.normpath(str(raw).strip().strip('"'))
+            if not os.path.isfile(path):
+                continue
+            key = os.path.normcase(os.path.abspath(path))
+            if key in existing:
+                continue
+            existing.add(key)
+            self.queue_items.append({"path": path, "status": "waiting"})
+            added += 1
+        if added:
+            self._queue_refresh_list()
+            self._save_queue_quiet()
+            self.set_status(f"В очередь добавлено: {added}")
+            self._log(f"В очередь добавлено файлов: {added}\n")
+        else:
+            self.set_status("Новых файлов для очереди нет.")
+
+    def _queue_remove_selected(self):
+        if self._running:
+            self.set_status("Идёт транскодирование — дождитесь окончания.")
+            return
+        index = self._queue_selected_index()
+        if index is None:
+            self.set_status("Выберите файл в очереди.")
+            return
+        if 0 <= index < len(self.queue_items):
+            del self.queue_items[index]
+        self._queue_refresh_list(preserve_selection=False)
+        self._save_queue_quiet()
+        self.set_status("Удалено из очереди.")
+
+    def _on_queue_delete(self, _event=None):
+        self._queue_remove_selected()
+        return "break"
+
+    def _on_queue_select(self, _event=None):
+        """Показывает информацию о выделенном файле очереди."""
+        index = self._queue_selected_index()
+        if index is None:
+            return
+        if not (0 <= index < len(self.queue_items)):
+            return
+        path = self.queue_items[index].get("path", "")
+        if not path or not os.path.isfile(path):
+            return
+
+        self._queue_info_req += 1
+        req = self._queue_info_req
+        if self._running:
+            # Во время кодирования нельзя менять глобальные _duration,
+            # _total_frames и т.п. — это сломает прогресс текущего задания.
+            # Поэтому обновляем только панель «Информация о видео».
+            self._reset_info()
+            self.info_vars["file"].set(Path(path).name)
+            threading.Thread(target=self._probe_queue_info_bg,
+                             args=(path, req), daemon=True).start()
+        else:
+            self._set_input_file(path, user_selected=True)
+            self.set_status(
+                f"Выбран файл очереди: {os.path.basename(path)}")
+
+    def _queue_move_selection(self, delta: int):
+        """Перемещает выделение в очереди, не уводя фокус на кнопки."""
+        if not self.queue_items:
+            return "break"
+        selected = self._queue_selected_index()
+        if selected is not None:
+            index = selected + delta
+        else:
+            index = 0 if delta > 0 else len(self.queue_items) - 1
+        index = max(0, min(len(self.queue_items) - 1, index))
+        self._queue_select_index(index)
+        self._on_queue_select()
+        return "break"
+
+    def _probe_queue_info_bg(self, path: str, req: int):
+        info = probe_info(path)
+
+        def apply():
+            if req != self._queue_info_req:
+                return
+            if not os.path.isfile(path):
+                return
+            self._apply_info(path, info)
+
+        self.after(0, apply)
+
+    # ---------------------------------------------------------- размер очереди
+    def _queue_resize_start(self, event):
+        self._queue_resize_y = int(event.y_root)
+        self._queue_resize_rows = int(self.queue_list.cget("height"))
+        bbox = self.queue_list.bbox("1.0")
+        if bbox:
+            self._queue_row_height = max(1, int(bbox[3]))
+        else:
+            self._queue_row_height = max(
+                1, tkfont.Font(font=FONT_UI).metrics("linespace") + 2)
+
+    def _queue_resize_drag(self, event):
+        if getattr(self, "_queue_resize_y", None) is None:
+            return
+        delta = int(round(
+            (int(event.y_root) - self._queue_resize_y)
+            / max(1, self._queue_row_height)))
+        self._queue_set_rows(self._queue_resize_rows + delta)
+
+    def _queue_resize_end(self, _event=None):
+        self._queue_resize_y = None
+        self._update_min_height()
+        self._grow_to_min_height()
+
+    def _queue_resize_reset(self, _event=None):
+        self._queue_set_rows(QUEUE_DEFAULT_ROWS)
+        self._grow_to_min_height()
+
+    def _queue_set_rows(self, rows: int):
+        rows = max(QUEUE_DEFAULT_ROWS, min(QUEUE_MAX_ROWS, int(rows)))
+        if int(self.queue_list.cget("height")) == rows:
+            return
+        self.queue_list.configure(height=rows)
+        self._update_min_height()
+
+    def _grow_to_min_height(self):
+        """Если очередь развернули сильнее, чем влезает окно, подрастаем."""
+        try:
+            if self.state() == "zoomed":
+                return
+            self.update_idletasks()
+            min_h = int(self.minsize()[1])
+            if self.winfo_height() < min_h:
+                self.geometry(f"{self.winfo_width()}x{min_h}")
+        except tk.TclError:
+            pass
+
+    def _queue_clear(self):
+        if self._running:
+            self.set_status("Идёт транскодирование — дождитесь окончания.")
+            return
+        if not self.queue_items:
+            return
+        if not messagebox.askyesno(
+                APP_TITLE, "Очистить очередь?", parent=self):
+            return
+        self.queue_items.clear()
+        self._queue_refresh_list()
+        self._save_queue_quiet()
+        self.set_status("Очередь очищена.")
+
+    # ---------------------------------------------------------- подготовка задания
+    def _collect_job_settings(self) -> dict:
+        return {
+            "cfg": dict(self._current_config()),
+            "target_enabled": bool(self.target_enabled_var.get()),
+            "target_size_mb": int(self.target_size_var.get()),
+            "quality_raw": self.quality_var.get(),
+            "passes": int(self.pass_var.get()),
+            "scale_enabled": bool(self.scale_enabled_var.get()),
+            "scale_height": self.scale_height_var.get(),
+            "scale_keep_aspect": bool(self.scale_keep_aspect_var.get()),
+            "fps_enabled": bool(self.fps_enabled_var.get()),
+            "fps_raw": self.fps_value_var.get(),
+            "trim_enabled": bool(self.trim_enabled_var.get()),
+            "trim_start": self.trim_start_var.get(),
+            "trim_start_unit": self.trim_start_unit_var.get(),
+            "trim_end": self.trim_end_var.get(),
+            "trim_end_unit": self.trim_end_unit_var.get(),
+            "subs_enabled": bool(self.subs_enabled_var.get()),
+            "subs_path": self.subs_path_var.get().strip().strip('"'),
+            "subs_mode": self._subs_mode_key(),
+            "naming_enabled": bool(self.ui_options.get("naming_enabled", True)),
+            "naming_template": self.naming_template_var.get(),
+            "archive_dir_mode": self.archive_dir_mode_var.get(),
+            "archive_root": self.archive_root_var.get(),
+            "cleanup": bool(self.cleanup_var.get()),
+            "ui_options": dict(self.ui_options),
+        }
+
+    def _quality_from_settings(self, settings: dict, duration: float):
+        cfg = settings["cfg"]
+        if settings["target_enabled"]:
+            if duration <= 0:
                 raise ValueError("нужно знать длительность видео")
-            q = self._compute_target_bitrate()
-            if q <= 0:
-                raise ValueError("не удаётся посчитать битрейт")
+            mb = float(settings["target_size_mb"])
+            total = mb * MB_TO_MBIT / duration
+            q = max(total - AUDIO_RESERVE_MBIT, 0.1)
             return q, True
 
-        raw = self.quality_var.get().replace(",", ".").strip()
+        raw = str(settings["quality_raw"]).replace(",", ".").strip()
         if cfg["quality_mode"] == "crf":
             lo, hi = quality_range(cfg)
             try:
@@ -3339,121 +4610,287 @@ class TranscodeApp(_BaseTk):
                 raise ValueError("битрейт должен быть > 0")
         return q, False
 
+    def _scale_filter_from_settings(self, settings: dict, info: dict) -> str:
+        if not settings["ui_options"].get("rescale_enabled", True):
+            return ""
+        if not settings["scale_enabled"]:
+            return ""
+        raw = str(settings["scale_height"]).strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            raise ValueError("укажите корректную высоту для рескейлинга")
+        target_h = int(raw)
+        w = int(info.get("width", 0) or 0)
+        h = int(info.get("height", 0) or 0)
+        if w <= 0 or h <= 0:
+            if settings["scale_keep_aspect"]:
+                return f"scale=-2:{target_h}"
+            return f"scale={target_h}:{target_h}"
+        if settings["scale_keep_aspect"]:
+            target_w = max(2, int(round(w * target_h / h)))
+            target_w -= target_w % 2
+            target_h -= target_h % 2
+            return f"scale={target_w}:{target_h}"
+        return f"scale={max(2, target_h)}:{max(2, target_h)}"
+
+    def _fps_value_from_settings(self, settings: dict, info: dict) -> float:
+        if not settings["ui_options"].get("fps_enabled", True):
+            return 0.0
+        if not settings["fps_enabled"]:
+            return 0.0
+        raw = str(settings["fps_raw"]).replace(",", ".").strip()
+        try:
+            v = float(raw)
+        except ValueError:
+            raise ValueError("укажите корректный FPS")
+        if v <= 0:
+            raise ValueError("FPS должен быть больше нуля")
+        src_fps = float(info.get("fps", 0) or 0)
+        if src_fps > 0 and v >= src_fps - 0.01:
+            raise ValueError("целевой FPS должен быть меньше исходного "
+                             f"({_fmt_fps(src_fps)})")
+        return v
+
+    def _subtitle_from_settings(self, settings: dict) -> tuple[str, str]:
+        if not settings["ui_options"].get("subs_enabled", True):
+            return "", ""
+        if not settings["subs_enabled"]:
+            return "", ""
+        path = str(settings["subs_path"]).strip().strip('"')
+        if not path:
+            raise ValueError("выберите файл титров")
+        if not os.path.isfile(path):
+            raise ValueError(f"файл титров не найден: {path}")
+        mode = str(settings["subs_mode"] or "soft").lower()
+        if mode not in SUBS_MODE_LABELS:
+            mode = "soft"
+        return os.path.abspath(path), mode
+
+    def _prepare_job(self, inp: str, settings: dict, index: int = 1) -> dict:
+        """Собирает всё для одного файла: probe, параметры, имя, команды.
+
+        Не обращается к Tk-переменным, поэтому может вызываться из рабочего
+        потока очереди.
+        """
+        cfg = dict(settings["cfg"])
+        ext = cfg["ext"]
+        advanced = bool(str(cfg.get("advanced_log", "") or "").strip())
+        info = probe_info(inp)
+        duration = float(info.get("duration", 0) or 0)
+        total_frames = int(info.get("total_frames", 0) or 0)
+        fps = float(info.get("fps", 0) or 0)
+
+        trim_start, trim_end = 0.0, None
+        if (settings["trim_enabled"]
+                and settings["ui_options"].get("trim_enabled", True)
+                and not advanced):
+            trim_start, trim_end = _trim_bounds(
+                settings["trim_start"], settings["trim_start_unit"],
+                settings["trim_end"], settings["trim_end_unit"],
+                duration, fps)
+        trim_duration = (trim_end - trim_start
+                         if trim_end is not None else None)
+        eff_duration = _trimmed_duration(duration, trim_start, trim_end)
+
+        quality, target_mode = 0.0, False
+        scale_filter, fps_value = "", 0.0
+        sub_file, sub_mode = "", ""
+        if not advanced:
+            quality, target_mode = self._quality_from_settings(
+                settings, eff_duration)
+            scale_filter = self._scale_filter_from_settings(settings, info)
+            fps_value = self._fps_value_from_settings(settings, info)
+            sub_file, sub_mode = self._subtitle_from_settings(settings)
+        sub_source = sub_file
+
+        out = self._out_path(inp, ext, cfg, info, index, settings)
+        out_dir = os.path.dirname(os.path.abspath(out))
+        if not os.path.isdir(out_dir):
+            raise ValueError(f"папка для результата не найдена: {out_dir}")
+
+        # При обрезке внешние субтитры нужно сдвинуть на начало, иначе
+        # реплики останутся на исходной шкале времени.
+        temp_files: list[str] = []
+        sub_skipped = False
+        if sub_file and trim_start > 0:
+            shifted = _shift_subtitles(sub_file, trim_start)
+            if shifted:
+                temp_files.append(shifted)
+                sub_file = shifted
+            else:
+                sub_file, sub_mode, sub_skipped = "", "", True
+
+        burn_filter = ""
+        if sub_file and sub_mode == "burn":
+            burn_filter = _subtitle_filter_expr(sub_file)
+        vf = _combine_filters(scale_filter, burn_filter)
+
+        vcodec = resolve_vcodec(cfg)
+        two_pass = (settings["passes"] == 2
+                    and bool(cfg.get("two_pass", False))
+                    and not advanced
+                    and vcodec not in GPU_CODECS
+                    and (cfg.get("quality_mode") != "crf" or target_mode))
+
+        # Статистику двупрохода держим в отдельной временной папке, чтобы
+        # не оставлять ffmpeg2pass-*.log / x265_2pass.log рядом с видео.
+        passlog_dir = ""
+        passlog_prefix = ""
+        if two_pass:
+            passlog_dir = tempfile.mkdtemp(prefix="t98_pass_")
+            passlog_prefix = os.path.join(passlog_dir, "pass")
+
+        try:
+            commands = build_commands(
+                cfg, inp, out, quality, two_pass, target_mode, vf, fps_value,
+                trim_start=trim_start,
+                trim_duration=trim_duration,
+                subtitle_file=sub_file if sub_mode == "soft" else "",
+                subtitle_codec=_subtitle_codec_for_ext(ext),
+                passlog_prefix=passlog_prefix,
+            )
+        except Exception:
+            for path in temp_files:
+                _remove_file(path)
+            if passlog_dir:
+                shutil.rmtree(passlog_dir, ignore_errors=True)
+            raise
+
+        eff_frames = total_frames
+        if fps > 0 and duration > 0:
+            if trim_duration is not None:
+                eff_frames = max(0, int(round(trim_duration * fps)))
+            elif trim_start > 0:
+                eff_frames = max(
+                    0, total_frames - int(round(trim_start * fps)))
+
+        return {
+            "inp": inp,
+            "out": out,
+            "commands": commands,
+            "duration": eff_duration,
+            "total_frames": eff_frames,
+            "cfg": cfg,
+            "settings": settings,
+            "advanced": advanced,
+            "target_mode": target_mode,
+            "quality": quality,
+            "scale_filter": scale_filter,
+            "fps_value": fps_value,
+            "trim_start": trim_start,
+            "trim_end": trim_end,
+            "trim_duration": trim_duration,
+            "subtitle_file": sub_file,
+            "subtitle_source": sub_source,
+            "subtitle_mode": sub_mode,
+            "subtitle_skipped": sub_skipped,
+            "temp_files": temp_files,
+            "passlog_dir": passlog_dir,
+            "cleanup": bool(settings["cleanup"]),
+            "info": info,
+        }
+
+    def _archive_dir_from_settings(
+            self, settings: dict | None = None) -> Path | None:
+        """Возвращает точную папку old_material для исходника.
+
+        None означает стандартное поведение: old_material рядом с видео.
+        Метод не читает Tk-переменные, поэтому безопасен для очереди.
+        """
+        settings = settings or {}
+        mode = str(settings.get(
+            "archive_dir_mode",
+            self.prefs.get("archive_dir_mode", "source")) or "source"
+        ).strip().lower()
+        root = str(settings.get(
+            "archive_root",
+            self.prefs.get("archive_root", "")) or ""
+        ).strip().strip('"')
+        if mode != "custom" or not root:
+            return None
+        base = Path(os.path.expandvars(os.path.expanduser(root)))
+        try:
+            base = base.resolve()
+        except OSError:
+            base = Path(os.path.abspath(str(base)))
+        if base.name.lower() == ARCHIVE_DIR_NAME:
+            return base
+        return base / ARCHIVE_DIR_NAME
+
+    def _archive_location_hint(self) -> str:
+        target = self._archive_dir_from_settings()
+        if target is not None:
+            return f"Исходник будет перемещён в папку {target}"
+        return (f"Исходник будет перемещён в подпапку {ARCHIVE_DIR_NAME} "
+                f"рядом с исходным видео")
+
+    def _default_output_dir(self, inp: str) -> str:
+        p = Path(inp).resolve()
+        if p.parent.name.lower() == ARCHIVE_DIR_NAME:
+            return str(p.parent.parent)
+        return str(p.parent)
+
+    def _out_path(self, inp: str, ext: str, cfg: dict | None = None,
+                  info: dict | None = None, index: int = 1,
+                  settings: dict | None = None) -> str:
+        cfg = cfg or self._current_config()
+        settings = settings or {}
+        naming_on = settings.get(
+            "naming_enabled", self.ui_options.get("naming_enabled", True))
+        if naming_on:
+            # Значение берём из снимка настроек: _out_path вызывается и из
+            # рабочего потока очереди, где обращаться к Tk-переменным нельзя.
+            if "naming_template" in settings:
+                template = settings["naming_template"]
+            else:
+                template = self.naming_template_var.get()
+            name = _expand_naming_template(template, inp, ext, cfg, info, index)
+        else:
+            name = _legacy_output_name(ext)
+        out_dir = self._default_output_dir(inp)
+        return _unique_output_path(os.path.join(out_dir, name), inp)
+
     def _start(self):
         if self._running:
             return
+        if (self.ui_options.get("queue_enabled", True)
+                and self._has_pending_queue()):
+            self._start_queue()
+        else:
+            self._start_single()
 
+    def _start_single(self):
         inp = self.file_var.get().strip().strip('"')
         if not inp or not os.path.isfile(inp):
             messagebox.showerror(APP_TITLE, "Входной файл не найден.")
             return
 
-        cfg = self._current_config()
-        ext = cfg["ext"]
-        adv = str(cfg.get("advanced_log", "") or "").strip()
-        advanced = bool(adv)
-        vcodec = resolve_vcodec(cfg)
-        two_pass = (self.pass_var.get() == 2
-                    and bool(cfg.get("two_pass", False))
-                    and not advanced
-                    and vcodec not in GPU_CODECS
-                    and (cfg.get("quality_mode") != "crf"
-                         or self.target_enabled_var.get()))
-
-        quality, target_mode = 0.0, False
-        scale_filter, fps_value = "", 0.0
-        if advanced:
-            # Расширенный лог задаёт команду целиком. Не валидируем и не
-            # применяем поля главного окна — иначе «мусор» в них мешает
-            # запуску, хотя на команду всё равно не влияет.
-            target_mode = False
-        else:
-            try:
-                quality, target_mode = self._resolve_quality()
-            except ValueError as e:
-                messagebox.showerror(APP_TITLE, f"Ошибка: {e}")
-                return
-
-            try:
-                scale_filter = self._scale_filter()
-            except ValueError as e:
-                messagebox.showerror(APP_TITLE, f"Ошибка рескейлинга: {e}")
-                return
-
-            try:
-                fps_value = self._fps_value()
-            except ValueError as e:
-                messagebox.showerror(APP_TITLE, f"Ошибка FPS: {e}")
-                return
-
-        out = self._out_path(inp, ext)
-        out_dir = os.path.dirname(os.path.abspath(out))
-        if not os.path.isdir(out_dir):
-            messagebox.showerror(
-                APP_TITLE, f"Папка для результата не найдена:\n{out_dir}")
+        settings = self._collect_job_settings()
+        self._save_prefs_quiet()
+        self.set_status("Подготовка…")
+        self.update_idletasks()
+        try:
+            job = self._prepare_job(inp, settings, index=1)
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, f"Ошибка: {exc}")
+            self.set_status("Готов.")
+            return
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"Ошибка подготовки: {exc}")
+            self.set_status("Готов.")
             return
 
-        commands = build_commands(cfg, inp, out, quality, two_pass,
-                                  target_mode, scale_filter, fps_value)
-
-        self.log.configure(state="normal")
-        self.log.delete("1.0", "end")
-        self.log.configure(state="disabled")
-
-        self._set_progress(0.0)
-        self._log(f"Вход:   {inp}\nВыход:  {out}\n")
-        shown_codec = resolve_vcodec(cfg)
-        self._log(f"Конфигурация: {cfg['name']}  (видео: {shown_codec})\n")
-        backend = cfg.get("backend", "cpu")
-        self._log(f"Бэкенд: {ENCODER_BACKENDS.get(backend, backend)}\n")
-        if advanced:
-            self._log("Режим: расширенный лог (перекрывает параметры редактора)\n")
-            ignored = []
-            if self.target_enabled_var.get():
-                ignored.append("целевой размер")
-            if self.scale_enabled_var.get():
-                ignored.append("рескейлинг")
-            if self.fps_enabled_var.get():
-                ignored.append("FPS")
-            if self.pass_var.get() == 2:
-                ignored.append("двупроход")
-            if ignored:
-                self._log("Игнорируются (заданы в логе): "
-                          + ", ".join(ignored) + "\n")
-        if target_mode:
-            self._log(f"Режим:  целевой размер {self.target_size_var.get()} МБ "
-                      f"→ {quality:.2f} Мбит/с\n")
-        if scale_filter:
-            self._log(f"Рескейлинг: {scale_filter}\n")
-        if fps_value > 0:
-            self._log(f"FPS:   → {fps_value:g}\n")
-        self._log("\n")
-
-        if self._duration <= 0 or self._total_frames <= 0:
-            self.set_status("Определение длительности…")
-            self.update_idletasks()
-            info = probe_info(inp)
-            self._duration = info["duration"]
-            self._total_frames = int(info.get("total_frames", 0) or 0)
-            self._apply_info(inp, info)
-
-        if self._duration > 0:
-            self._log(f"Длительность: {_fmt_time(self._duration)}"
-                      + (f" ({_fmt_int(self._total_frames)} кадров)"
-                         if self._total_frames > 0 else "")
-                      + "\n")
-        else:
-            self._log("Не удалось определить длительность — прогресс будет без %.\n")
-
-        cleanup_after = self.cleanup_var.get()
-        if cleanup_after:
-            self._log(f"После успеха исходник → {ARCHIVE_DIR_NAME}\n")
+        self._begin_job_ui(job, 0, 0, clear_log=True)
 
         self._running = True
         self._cancel = False
+        self._skip_current = False
+        self._queue_running = False
         self.start_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
+        self._begin_pause_ui()
         self.cleanup_cb.configure(state="disabled")
+        self.queue_skip_btn.configure(state="disabled")
+        self._set_queue_controls_state("disabled")
         self.open_loc_btn.pack_forget()
         self._update_min_height()
         self._last_output = None
@@ -3463,28 +4900,352 @@ class TranscodeApp(_BaseTk):
         self._set_title_progress(0.0)
 
         threading.Thread(
-            target=self._run_worker,
-            args=(commands, out, inp, cleanup_after),
+            target=self._run_worker, args=(job,), daemon=True,
+        ).start()
+
+    def _start_queue(self):
+        pending = [i for i, item in enumerate(self.queue_items)
+                   if item.get("status") == "waiting"]
+        if not pending:
+            messagebox.showinfo(
+                APP_TITLE,
+                "В очереди нет файлов со статусом «ожидает».\n"
+                "Добавьте файлы или очистите очередь.",
+                parent=self)
+            return
+
+        settings = self._collect_job_settings()
+        self._save_prefs_quiet()
+        try:
+            cfg = settings["cfg"]
+            if (not str(cfg.get("advanced_log", "") or "").strip()
+                    and not settings["target_enabled"]):
+                self._quality_from_settings(settings, 0)
+            self._subtitle_from_settings(settings)
+        except ValueError as exc:
+            messagebox.showerror(APP_TITLE, f"Ошибка: {exc}")
+            return
+
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+
+        self._running = True
+        self._cancel = False
+        self._skip_current = False
+        self._queue_running = True
+        # Галочку «Исходник → old_material» можно менять и во время
+        # очереди: значение применится к текущему/следующим файлам.
+        settings["cleanup"] = bool(self.cleanup_var.get())
+        self._queue_cleanup = settings["cleanup"]
+        self._queue_pos = 0
+        self._queue_total = len(pending)
+        self._progress_base = 0.0
+        self._progress_span = 1.0
+        self._last_output = None
+        self._set_progress(0.0)
+        self.start_btn.configure(state="disabled")
+        self.cancel_btn.configure(state="normal")
+        self._begin_pause_ui()
+        self.cleanup_cb.configure(state="normal")
+        self.queue_skip_btn.configure(state="normal")
+        self._set_queue_controls_state("disabled")
+        self.open_loc_btn.pack_forget()
+        self._update_min_height()
+        self.set_status(f"Очередь: 0/{len(pending)}")
+        self._cancel_taskbar_clear()
+        self._taskbar.begin(0.0)
+        self._set_title_progress(0.0)
+        self._log(f"Очередь: {len(pending)} файлов\n")
+
+        threading.Thread(
+            target=self._queue_worker,
+            args=(pending, settings),
             daemon=True,
         ).start()
 
+    def _begin_job_ui(self, job: dict, pos: int = 0, total: int = 0,
+                      clear_log: bool = False):
+        if clear_log:
+            self.log.configure(state="normal")
+            self.log.delete("1.0", "end")
+            self.log.configure(state="disabled")
+
+        self._duration = float(job["duration"])
+        self._total_frames = int(job["total_frames"])
+        self._queue_pos = pos
+        self._queue_total = total
+        if total > 0:
+            self._progress_base = (pos - 1) / total
+            self._progress_span = 1.0 / total
+        else:
+            self._progress_base = 0.0
+            self._progress_span = 1.0
+        self._set_progress(0.0)
+        self._set_title_progress(self._progress_base)
+
+        settings = job["settings"]
+        cfg = job["cfg"]
+        self._log(f"Вход:   {job['inp']}\nВыход:  {job['out']}\n")
+        self._log(f"Конфигурация: {cfg['name']}  (видео: {resolve_vcodec(cfg)})\n")
+        backend = cfg.get("backend", "cpu")
+        self._log(f"Бэкенд: {ENCODER_BACKENDS.get(backend, backend)}\n")
+        if job["advanced"]:
+            self._log("Режим: расширенный лог (перекрывает параметры редактора)\n")
+            ignored = []
+            if settings["target_enabled"]:
+                ignored.append("целевой размер")
+            if settings["scale_enabled"]:
+                ignored.append("рескейлинг")
+            if settings["fps_enabled"]:
+                ignored.append("FPS")
+            if settings["trim_enabled"]:
+                ignored.append("обрезка")
+            if settings["subs_enabled"]:
+                ignored.append("титры")
+            if settings["passes"] == 2:
+                ignored.append("двупроход")
+            if ignored:
+                self._log("Игнорируются (заданы в логе): "
+                          + ", ".join(ignored) + "\n")
+        if job["target_mode"]:
+            self._log(f"Режим:  целевой размер "
+                      f"{settings['target_size_mb']} МБ "
+                      f"→ {job['quality']:.2f} Мбит/с\n")
+        if job["scale_filter"]:
+            self._log(f"Рескейлинг: {job['scale_filter']}\n")
+        if job["fps_value"] > 0:
+            self._log(f"FPS:   → {job['fps_value']:g}\n")
+        if job["trim_duration"] is not None:
+            self._log(f"Обрезка: {_fmt_time(job['trim_start'])} … "
+                      f"{_fmt_time(job['trim_start'] + job['trim_duration'])}\n")
+        elif job["trim_start"] > 0:
+            self._log(f"Обрезка: с {_fmt_time(job['trim_start'])} до конца\n")
+        if job["subtitle_file"]:
+            mode = ("вжечь" if job["subtitle_mode"] == "burn" else "встроить")
+            name = job.get("subtitle_source") or job["subtitle_file"]
+            self._log(f"Титры: {os.path.basename(name)} ({mode})\n")
+        elif job.get("subtitle_skipped"):
+            self._log("Титры: после начала обрезки реплик не осталось — "
+                      "пропущено.\n")
+        if self._duration > 0:
+            self._log(f"Длительность: {_fmt_time(self._duration)}"
+                      + (f" ({_fmt_int(self._total_frames)} кадров)"
+                         if self._total_frames > 0 else "")
+                      + "\n")
+        else:
+            self._log("Не удалось определить длительность — прогресс будет без %.\n")
+        if job["cleanup"]:
+            self._log(f"После успеха исходник → {ARCHIVE_DIR_NAME}\n")
+        self._log("\n")
+
+    def _begin_pause_ui(self):
+        """Готовит кнопку паузы к новому заданию."""
+        self._paused = False
+        self._proc_suspended = False
+        self._pause_event.set()
+        self.pause_btn.configure(state="normal", text=PAUSE_LABEL)
+
+    def _reset_pause_ui(self):
+        """Сбрасывает паузу после завершения задания."""
+        self._paused = False
+        self._proc_suspended = False
+        self._pause_event.set()
+        if hasattr(self, "pause_btn"):
+            self.pause_btn.configure(state="disabled", text=PAUSE_LABEL)
+
+    def _toggle_pause(self):
+        if not self._running:
+            return
+        self._paused = not self._paused
+        if self._paused:
+            self._pause_event.clear()
+            self._apply_process_pause()
+            self.pause_btn.configure(text=RESUME_LABEL)
+            self.set_status("Пауза.")
+            self._taskbar.set_state(self._taskbar.PAUSED)
+            self._log("Пауза.\n")
+        else:
+            self._pause_event.set()
+            self._apply_process_pause()
+            self.pause_btn.configure(text=PAUSE_LABEL)
+            self.set_status("Продолжение…")
+            self._taskbar.set_state(self._taskbar.NORMAL)
+            self._log("Продолжение.\n")
+
+    def _apply_process_pause(self):
+        """Приостанавливает/возобновляет текущий процесс ffmpeg.
+
+        Флаг _proc_suspended не даёт приостановить процесс дважды.
+        """
+        with self._pause_lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                self._proc_suspended = False
+                return
+            if self._paused:
+                if not self._proc_suspended:
+                    if set_process_suspended(proc, True):
+                        self._proc_suspended = True
+            elif self._proc_suspended:
+                set_process_suspended(proc, False)
+                self._proc_suspended = False
+
+    def _wait_while_paused(self):
+        while self._paused and not self._cancel and not self._skip_current:
+            self._pause_event.wait(0.1)
+
     def _cancel_job(self):
         self._cancel = True
+        if hasattr(self, "pause_btn"):
+            self.pause_btn.configure(state="disabled")
         if self._proc and self._proc.poll() is None:
             try:
                 self._proc.terminate()
             except Exception:
                 pass
         self._taskbar.set_state(self._taskbar.PAUSED)
-        self.set_status("Отмена…")
+        self.set_status("Отмена очереди…" if self._queue_running else "Отмена…")
 
-    def _run_worker(self, commands, out: str, inp: str, cleanup_after: bool):
+    def _skip_current_job(self):
+        if not self._running or not self._queue_running:
+            return
+        self._skip_current = True
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+        self.set_status("Пропуск файла…")
+
+    def _queue_worker(self, indices: list[int], settings: dict):
+        total = len(indices)
+        done = errors = skipped = 0
+
+        for pos, index in enumerate(indices, 1):
+            if self._cancel:
+                break
+            item = self.queue_items[index]
+            path = item.get("path", "")
+            self._skip_current = False
+            started_at = datetime.datetime.now().strftime("%H:%M:%S")
+            self.after(0, self._queue_set_status, index, "running",
+                       started_at)
+            self._log_threadsafe(
+                f"\n=== Очередь {pos}/{total}: {os.path.basename(path)} ===\n")
+
+            if not os.path.isfile(path):
+                self._log_threadsafe("Файл не найден.\n")
+                self.after(0, self._queue_set_status, index, "error",
+                           None, datetime.datetime.now().strftime("%H:%M:%S"))
+                errors += 1
+                continue
+
+            settings["cleanup"] = bool(
+                getattr(self, "_queue_cleanup", settings["cleanup"]))
+            try:
+                job = self._prepare_job(path, settings, index=pos)
+            except Exception as exc:
+                self._log_threadsafe(f"Ошибка подготовки: {exc}\n")
+                self.after(0, self._queue_set_status, index, "error",
+                           None, datetime.datetime.now().strftime("%H:%M:%S"))
+                errors += 1
+                continue
+
+            self.after(0, self._begin_job_ui, job, pos, total, False)
+            try:
+                result, moved_to, move_error = self._execute_job(job, pos, total)
+            except Exception as exc:
+                self._log_threadsafe(f"\n!!! Непредвиденная ошибка: {exc}\n")
+                self._cleanup_job_files(job)
+                result, moved_to, move_error = "error", None, None
+
+            # Если исходник перенесён в old_material, обновляем путь в
+            # очереди — иначе после перезапуска он станет недействительным.
+            if moved_to:
+                self.after(0, self._queue_update_path, index, moved_to)
+
+            if result == "ok":
+                done += 1
+                status = "done"
+            elif result == "skip":
+                skipped += 1
+                status = "skipped"
+            elif result == "cancel":
+                status = "cancelled"
+            else:
+                errors += 1
+                status = "error"
+
+            self.after(0, self._queue_set_status, index, status, None,
+                       datetime.datetime.now().strftime("%H:%M:%S"))
+            self.after(0, self._queue_after_job, job, result,
+                       moved_to, move_error)
+            if result == "cancel":
+                break
+
+        self.after(0, self._finish_queue, done, errors, skipped,
+                   total, self._cancel)
+
+    def _queue_after_job(self, job: dict, result: str,
+                         moved_to: str | None, move_error: str | None):
+        if result == "ok":
+            self._last_output = job["out"]
+            if os.path.isfile(job["out"]):
+                try:
+                    self._log(f"Результат: {os.path.basename(job['out'])} "
+                              f"({_fmt_size(os.path.getsize(job['out']))})\n")
+                except OSError:
+                    pass
+        if moved_to:
+            self._log(f"Исходник перемещён: {moved_to}\n")
+        if move_error and not self._close_when_done:
+            messagebox.showwarning(
+                APP_TITLE,
+                "Видео готово, но исходник не удалось переместить "
+                f"в old_material:\n{move_error}")
+
+    def _run_worker(self, job: dict):
+        try:
+            result, moved_to, move_error = self._execute_job(job)
+        except Exception as exc:
+            self._log_threadsafe(f"\n!!! Непредвиденная ошибка: {exc}\n")
+            self._cleanup_job_files(job)
+            result, moved_to, move_error = "error", None, None
+        self.after(0, self._finish, result, moved_to, move_error, job["out"])
+
+    def _execute_job(self, job: dict, pos: int = 0,
+                     total: int = 0) -> tuple[str, str | None, str | None]:
+        commands = job["commands"]
+        out = job["out"]
+        inp = job["inp"]
+        cleanup_after = bool(job.get("cleanup"))
         ok = True
         cwd = os.path.dirname(os.path.abspath(out)) or None
         total_passes = len(commands)
 
+        # Дублируем в атрибуты для _pump_progress/_update_status: рабочий
+        # поток может опередить обработку after() в главном потоке.
+        self._duration = float(job.get("duration", 0) or 0)
+        self._total_frames = int(job.get("total_frames", 0) or 0)
+        self._queue_pos = pos
+        self._queue_total = total
+        if total > 0:
+            self._progress_base = (pos - 1) / total
+            self._progress_span = 1.0 / total
+        else:
+            self._progress_base = 0.0
+            self._progress_span = 1.0
+
         for idx, base_cmd in enumerate(commands, 1):
-            if self._cancel:
+            if self._cancel or self._skip_current:
+                ok = False
+                break
+
+            # Пауза, нажатая во время подготовки/между проходами, не даёт
+            # запустить следующий процесс ffmpeg, пока её не снимут.
+            self._wait_while_paused()
+            if self._cancel or self._skip_current:
                 ok = False
                 break
 
@@ -3494,7 +5255,7 @@ class TranscodeApp(_BaseTk):
                 " ".join(cmd) + "\n\n")
 
             try:
-                self._proc = subprocess.Popen(
+                proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -3511,22 +5272,34 @@ class TranscodeApp(_BaseTk):
                 ok = False
                 break
 
+            with self._pause_lock:
+                self._proc_suspended = False
+                self._proc = proc
+            # Если паузу нажали прямо во время запуска процесса —
+            # приостанавливаем его сразу после старта.
+            self._apply_process_pause()
+
             base_frac = (idx - 1) / total_passes
             span = 1.0 / total_passes
 
             t_prog = threading.Thread(
                 target=self._pump_progress,
-                args=(self._proc, base_frac, span, idx, total_passes),
+                args=(proc, base_frac, span, idx, total_passes),
                 daemon=True)
             t_err = threading.Thread(
-                target=self._pump_stderr, args=(self._proc,), daemon=True)
+                target=self._pump_stderr, args=(proc,), daemon=True)
             t_prog.start()
             t_err.start()
             t_prog.join()
             t_err.join()
-            rc = self._proc.wait()
+            rc = proc.wait()
+            with self._pause_lock:
+                self._proc_suspended = False
 
-            if rc != 0 and not self._cancel:
+            if self._cancel or self._skip_current:
+                ok = False
+                break
+            if rc != 0:
                 self._log_threadsafe(
                     f"\n!!! ffmpeg завершился с кодом {rc} !!!\n")
                 ok = False
@@ -3537,6 +5310,8 @@ class TranscodeApp(_BaseTk):
 
         if self._cancel:
             self._log_threadsafe("\n✘ Прервано пользователем.\n")
+        elif self._skip_current:
+            self._log_threadsafe("\n↷ Файл пропущен.\n")
         elif ok:
             if not os.path.isfile(out) or os.path.getsize(out) <= 0:
                 ok = False
@@ -3546,11 +5321,25 @@ class TranscodeApp(_BaseTk):
         else:
             self._log_threadsafe("\n✘ Ошибка.\n")
 
-        if ok and not self._cancel and cleanup_after:
-            self.after(0, self.set_status, "Перемещение исходника в old_material…")
+        # Не оставляем недописанные файлы после отмены/пропуска/ошибки.
+        if not ok or self._cancel or self._skip_current:
+            try:
+                if os.path.isfile(out):
+                    os.remove(out)
+            except OSError:
+                pass
+
+        # В очереди галочку можно переключить прямо во время кодирования:
+        # читаем актуальное значение в главном потоке через обычный bool.
+        if self._queue_running:
+            cleanup_after = bool(
+                getattr(self, "_queue_cleanup", cleanup_after))
+
+        if ok and not self._cancel and not self._skip_current and cleanup_after:
             self._log_threadsafe("\nПеремещение исходника в old_material…\n")
             try:
-                moved_to = archive_source(inp)
+                moved_to = archive_source(
+                    inp, self._archive_dir_from_settings(job.get("settings")))
                 if moved_to:
                     self._log_threadsafe(f"Исходник перемещён: {moved_to}\n")
                 else:
@@ -3561,14 +5350,28 @@ class TranscodeApp(_BaseTk):
                 self._log_threadsafe(
                     f"!!! Не удалось переместить исходник: {exc}\n")
 
+        with self._pause_lock:
+            self._proc = None
+            self._proc_suspended = False
         if self._cancel:
             result = "cancel"
+        elif self._skip_current:
+            result = "skip"
         elif ok:
             result = "ok"
         else:
             result = "error"
+        self._cleanup_job_files(job)
+        return result, moved_to, move_error
 
-        self.after(0, self._finish, result, moved_to, move_error, out)
+    def _cleanup_job_files(self, job: dict):
+        """Удаляет временные файлы задания (сдвинутые субтитры, статистика)."""
+        for path in job.get("temp_files", []) or []:
+            _remove_file(path)
+        passlog_dir = job.get("passlog_dir")
+        if passlog_dir:
+            shutil.rmtree(passlog_dir, ignore_errors=True)
+
 
     def _pump_progress(self, proc, base_frac: float, span: float,
                        pass_idx: int, total_passes: int):
@@ -3621,16 +5424,27 @@ class TranscodeApp(_BaseTk):
     def _update_status(self, frac: float, sec: float, speed: str,
                        pass_idx: int, total_passes: int,
                        frame: int = 0, enc_fps: str = ""):
+        overall = self._progress_base + self._progress_span * float(frac)
         self._set_progress(frac)
 
         if self._duration > 0:
-            self._taskbar.update(frac)
-            self._set_title_progress(frac)
+            if self._paused:
+                self._taskbar.set_value(overall)
+                self._taskbar.set_state(self._taskbar.PAUSED)
+            else:
+                self._taskbar.update(overall)
+            self._set_title_progress(overall)
         else:
-            self._taskbar.set_state(self._taskbar.INDETERMINATE)
+            self._taskbar.set_state(
+                self._taskbar.PAUSED if self._paused
+                else self._taskbar.INDETERMINATE)
             self.title(f"{APP_TITLE} — …")
 
         parts = []
+        if self._paused:
+            parts.append("Пауза")
+        if self._queue_total > 0:
+            parts.append(f"Очередь {self._queue_pos}/{self._queue_total}")
         if total_passes > 1:
             parts.append(f"Проход {pass_idx}/{total_passes}")
 
@@ -3680,10 +5494,19 @@ class TranscodeApp(_BaseTk):
     def _finish(self, result: str = "ok", moved_to: str | None = None,
                 move_error: str | None = None, out: str | None = None):
         self._running = False
+        self._queue_running = False
         self._proc = None
+        self._skip_current = False
+        self._queue_pos = 0
+        self._queue_total = 0
+        self._progress_base = 0.0
+        self._progress_span = 1.0
         self.start_btn.configure(state="normal")
         self.cancel_btn.configure(state="disabled")
+        self._reset_pause_ui()
         self.cleanup_cb.configure(state="normal")
+        self.queue_skip_btn.configure(state="disabled")
+        self._set_queue_controls_state("normal")
         self.title(APP_TITLE)
 
         if moved_to:
@@ -3723,21 +5546,117 @@ class TranscodeApp(_BaseTk):
             self._schedule_taskbar_clear(4000)
             self.set_status("Ошибка.")
 
-        if move_error:
+        self._update_start_label()
+
+        if move_error and not self._close_when_done:
             messagebox.showwarning(
                 APP_TITLE,
                 "Видео готово, но исходник не удалось переместить "
                 f"в old_material:\n{move_error}")
 
+        self._maybe_shutdown()
+
+    def _finish_queue(self, done: int, errors: int, skipped: int,
+                      total: int, cancelled: bool):
+        self._running = False
+        self._queue_running = False
+        self._proc = None
+        self._skip_current = False
+        self._queue_pos = 0
+        self._queue_total = 0
+        self._progress_base = 0.0
+        self._progress_span = 1.0
+        self.start_btn.configure(state="normal")
+        self.cancel_btn.configure(state="disabled")
+        self._reset_pause_ui()
+        self.cleanup_cb.configure(state="normal")
+        self.queue_skip_btn.configure(state="disabled")
+        self._set_queue_controls_state("normal")
+        self.title(APP_TITLE)
+
+        if cancelled:
+            self._set_progress(0.0)
+            self._taskbar.clear()
+            self.set_status("Очередь отменена.")
+        else:
+            self._set_progress(1.0)
+            self._taskbar.set_value(1.0)
+            self._schedule_taskbar_clear(2000)
+            parts = [f"Очередь завершена: {done} готово"]
+            if errors:
+                parts.append(f"{errors} ошибок")
+            if skipped:
+                parts.append(f"{skipped} пропущено")
+            self.set_status(" — ".join(parts),
+                            highlight=f"{done} готово" if done else None)
+            if self._last_output and os.path.isfile(self._last_output):
+                self.open_loc_btn.pack(side="right", padx=(8, 0))
+            if errors and not done:
+                self._taskbar.error()
+                self._schedule_taskbar_clear(4000)
+
+        self._update_min_height()
+        self._update_start_label()
+        self._log(f"\nОчередь: {total} файлов — готово {done}, "
+                  f"ошибок {errors}, пропущено {skipped}.\n")
+        self._save_queue_quiet()
+        self._maybe_shutdown()
+
+    def _maybe_shutdown(self):
+        """Закрывает окно, если пользователь уже нажал «крестик»."""
+        if self._close_when_done:
+            self._shutdown()
+
+    def _shutdown(self):
+        """Сохраняет состояние и закрывает окно ровно один раз."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._save_queue_quiet()
+        self._save_prefs_quiet()
+        self._cancel_taskbar_clear()
+        try:
+            self._taskbar.close()
+        except Exception:
+            pass
+        self.destroy()
+
+    def _force_close(self):
+        """Страховка: закрыть окно, даже если рабочий поток завис."""
+        if self._shutting_down:
+            return
+        self._cancel = True
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self._shutdown()
+
     def _on_close(self):
+        if self._shutting_down or self._close_when_done:
+            return
         if self._running:
             if not messagebox.askyesno(
                     APP_TITLE, "Процесс ещё выполняется. Прервать и выйти?"):
                 return
+            # Не закрываем окно сразу: рабочий поток должен успеть
+            # остановить ffmpeg, удалить недописанный результат и
+            # временные файлы. Окно закроется в _finish/_finish_queue,
+            # а _force_close — страховка на случай зависания.
+            self._close_when_done = True
             self._cancel_job()
-        self._cancel_taskbar_clear()
-        self._taskbar.close()
-        self.destroy()
+            # Пока был открыт диалог подтверждения, задание могло успеть
+            # завершиться — тогда рабочий поток уже не вызовет _finish.
+            if not self._running:
+                self._shutdown()
+                return
+            self.set_status("Остановка и очистка перед закрытием…")
+            self._log("Закрытие окна: ожидание остановки ffmpeg…\n")
+            self.after(10000, self._force_close)
+            return
+        self._shutdown()
 
 
 def main():
