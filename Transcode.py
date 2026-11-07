@@ -666,14 +666,28 @@ def _sanitize_prefs(prefs: dict | None) -> dict:
     return out
 
 
+def _sanitize_extension(ext, fallback: str = "mp4") -> str:
+    """Оставляет только безопасное расширение без путей и разделителей."""
+    def valid(value: str) -> bool:
+        return (bool(value) and len(value) <= 10
+                and value.isascii() and value.isalnum())
+
+    value = str(ext or "").strip().lstrip(".")
+    if valid(value):
+        return value
+    fallback_value = str(fallback or "").strip().lstrip(".")
+    if valid(fallback_value):
+        return fallback_value
+    return "mp4"
+
+
 def _sanitize_config(cfg: dict, fallback: dict | None = None) -> dict:
     """Приводит конфиг к валидному виду, подставляя значения по умолчанию."""
     base = dict(fallback or NEUTRAL_CONFIG)
     out = {}
     out["name"] = str(cfg.get("name") or base["name"]).strip() or "Без названия"
     out["vcodec"] = str(cfg.get("vcodec") or base["vcodec"]).strip() or base["vcodec"]
-    ext = str(cfg.get("ext") or base["ext"]).strip().lstrip(".")
-    out["ext"] = ext or base["ext"]
+    out["ext"] = _sanitize_extension(cfg.get("ext") or base["ext"], base["ext"])
     qm = str(cfg.get("quality_mode") or base["quality_mode"]).strip().lower()
     out["quality_mode"] = qm if qm in ("bitrate", "crf") else base["quality_mode"]
     try:
@@ -737,6 +751,21 @@ def _sanitize_config(cfg: dict, fallback: dict | None = None) -> dict:
     return out
 
 
+def _dedupe_config_names(configs: list[dict]) -> list[dict]:
+    """Делает имена конфигураций уникальными, сохраняя порядок списка."""
+    seen: set[str] = set()
+    for cfg in configs:
+        base = str(cfg.get("name") or "Без названия").strip() or "Без названия"
+        name = base
+        n = 2
+        while name in seen:
+            name = f"{base} ({n})"
+            n += 1
+        cfg["name"] = name
+        seen.add(name)
+    return configs
+
+
 def load_configs() -> list[dict]:
     """Читает пользовательские конфигурации с диска (или возвращает встроенные)."""
     path = config_path()
@@ -753,7 +782,7 @@ def load_configs() -> list[dict]:
     for item in raw:
         if isinstance(item, dict):
             result.append(_sanitize_config(item))
-    return result or default_configs()
+    return _dedupe_config_names(result) if result else default_configs()
 
 
 def load_ui_options() -> dict:
@@ -1110,11 +1139,12 @@ def _random_digits() -> str:
 
 def _legacy_output_name(ext: str) -> str:
     """Прежнее имя по умолчанию: untitled_<18 цифр>.<ext>."""
+    ext = _sanitize_extension(ext)
     return f"untitled_{_random_digits()}{_random_digits()}{_random_digits()}.{ext}"
 
 
 def _ensure_extension(name: str, ext: str) -> str:
-    suffix = "." + str(ext).lstrip(".")
+    suffix = "." + _sanitize_extension(ext)
     if name.lower().endswith(suffix.lower()):
         return name
     return name + suffix
@@ -1128,6 +1158,7 @@ def _expand_naming_template(template: str, inp: str, ext: str, cfg: dict,
     {preset}, {date}, {time}, {index}. Плюс %random% — шесть случайных цифр.
     """
     template = str(template or "").strip() or DEFAULT_NAMING_TEMPLATE
+    ext = _sanitize_extension(ext)
     info = info or {}
     src = Path(inp)
     fps = float(info.get("fps", 0) or 0)
@@ -1905,7 +1936,8 @@ class SettingsWindow(tk.Toplevel):
         self.transient(master)
         self.grab_set()
 
-        self.configs: list[dict] = [dict(c) for c in master.configs]
+        self.configs: list[dict] = _dedupe_config_names(
+            [dict(c) for c in master.configs])
         self.selected_index: int | None = None
         self.ui_options: dict = _sanitize_ui_options(master.ui_options)
 
@@ -2576,6 +2608,16 @@ class SettingsWindow(tk.Toplevel):
                                    parent=self)
             return False
         cfg = self._collect_editor()
+        if self._name_in_use(cfg["name"], self.selected_index):
+            if not silent:
+                messagebox.showwarning(
+                    APP_TITLE,
+                    "Конфигурация с таким названием уже есть. "
+                    "Выберите другое название.",
+                    parent=self)
+                return False
+            cfg["name"] = self._unique_name(cfg["name"])
+            self.var_name.set(cfg["name"])
         self.configs[self.selected_index] = cfg
         # Обновляем только текст элемента, не пересоздавая его и не трогая
         # выделение — иначе Tk сбрасывает selection во время обработки
@@ -2588,6 +2630,11 @@ class SettingsWindow(tk.Toplevel):
         return True
 
     # --------------------------------------------------- действия
+    def _name_in_use(self, name: str, exclude_index: int | None = None) -> bool:
+        """Проверяет, занято ли имя другой конфигурацией."""
+        return any(i != exclude_index and c.get("name") == name
+                   for i, c in enumerate(self.configs))
+
     def _unique_name(self, base: str) -> str:
         """Подбирает имя, которого ещё нет в списке конфигураций."""
         existing = {c["name"] for c in self.configs}
@@ -2647,7 +2694,7 @@ class SettingsWindow(tk.Toplevel):
         self._apply_editor(silent=True)
         src = self.configs[self.selected_index]
         copy_cfg = _sanitize_config(dict(src))
-        copy_cfg["name"] = src["name"] + " (копия)"
+        copy_cfg["name"] = self._unique_name(src["name"] + " (копия)")
         self.configs.append(copy_cfg)
         self.selected_index = len(self.configs) - 1
         self._refresh_list()
@@ -2934,7 +2981,7 @@ class TranscodeApp(_BaseTk):
             self.codec_var.set(names[0])
 
     def set_configs(self, configs: list[dict]):
-        self.configs = [dict(c) for c in configs]
+        self.configs = _dedupe_config_names([dict(c) for c in configs])
         self._refresh_codec_menu()
         if self.codec_var.get() not in [c["name"] for c in self.configs]:
             self.codec_var.set(self.configs[0]["name"])
@@ -4671,6 +4718,10 @@ class TranscodeApp(_BaseTk):
         Не обращается к Tk-переменным, поэтому может вызываться из рабочего
         потока очереди.
         """
+        # ffmpeg запускается с cwd папки результата, поэтому относительный
+        # входной путь нельзя оставлять относительным: он разрешится не от
+        # текущей папки приложения.
+        inp = os.path.abspath(os.path.expanduser(str(inp)))
         cfg = dict(settings["cfg"])
         ext = cfg["ext"]
         advanced = bool(str(cfg.get("advanced_log", "") or "").strip())
