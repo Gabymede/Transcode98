@@ -86,6 +86,7 @@ WARN_FG     = "#e06c6c"   # недопустимое значение в пол�
 ACCENT      = "#4d6a99"   # мягкий синий
 GREEN       = "#4dff4d"   # яркий зелёный
 QUEUE_TIME_FG = "#f8f0a6" # цвет времени в списке очереди
+QUEUE_SIZE_FG = ACCENT    # цвет веса «было → стало», как у статуса running
 
 FONT_UI   = ("MS Sans Serif", 9)
 FONT_BOLD = ("MS Sans Serif", 9, "bold")
@@ -221,6 +222,37 @@ CONFIG_DIR_NAME = "Transcode98"
 CONFIG_FILE_NAME = "configs.json"
 
 
+def _dir_writable(path: str) -> bool:
+    """Проверяет реальную возможность записи в папку.
+
+    os.access(..., os.W_OK) на Windows в основном смотрит на read-only-атрибут
+    и может вернуть True для Program Files, хотя ACL запись запрещает.
+    """
+    try:
+        with tempfile.NamedTemporaryFile(prefix=".t98_write_", dir=path):
+            return True
+    except OSError:
+        return False
+
+
+def _is_program_files_dir(path: str) -> bool:
+    """Проверяет, находится ли папка внутри Program Files."""
+    if sys.platform != "win32":
+        return False
+    target = os.path.normcase(os.path.abspath(path))
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(env)
+        if not root:
+            continue
+        root = os.path.normcase(os.path.abspath(root))
+        try:
+            if os.path.commonpath([target, root]) == root:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
 def config_path() -> Path:
     """Путь к файлу пользовательских конфигураций."""
     # Рядом с приложением (portable), иначе — в профиле пользователя.
@@ -228,7 +260,12 @@ def config_path() -> Path:
                                            else __file__))
     portable = os.path.join(base, CONFIG_FILE_NAME)
     try:
-        if os.access(base, os.W_OK):
+        # В Program Files даже администратору не стоит хранить пользовательские
+        # настройки: иначе при обычном запуске они станут недоступны.
+        # Исключение — уже существующий portable-конфиг в записываемой папке.
+        allow_portable = (os.path.isfile(portable)
+                          or not _is_program_files_dir(base))
+        if allow_portable and _dir_writable(base):
             return Path(portable)
     except Exception:
         pass
@@ -590,6 +627,7 @@ DEFAULT_PREFS = {
     "subs_path": "",
     "subs_mode": "soft",
     "queue_show_times": True,
+    "queue_show_sizes": True,
     "archive_dir_mode": "source",
     "archive_root": "",
 }
@@ -657,12 +695,12 @@ def _sanitize_prefs(prefs: dict | None) -> dict:
         prefs.get("archive_root", out["archive_root"]) or ""
     ).strip().strip('"')
 
-    raw_times = prefs.get("queue_show_times", out["queue_show_times"])
-    if isinstance(raw_times, str):
-        out["queue_show_times"] = raw_times.strip().lower() in (
-            "1", "true", "yes", "on")
-    else:
-        out["queue_show_times"] = bool(raw_times)
+    for key in ("queue_show_times", "queue_show_sizes"):
+        raw = prefs.get(key, out[key])
+        if isinstance(raw, str):
+            out[key] = raw.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            out[key] = bool(raw)
     return out
 
 
@@ -1090,6 +1128,14 @@ def _fmt_size(b: float) -> str:
             return f"{b:.1f} {unit}"
         b /= 1024
     return f"{b:.1f} ПБ"
+
+
+def _file_size(path: str) -> int:
+    """Размер файла в байтах или 0, если файл недоступен."""
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
 
 
 def _fmt_fps(f: float) -> str:
@@ -1931,7 +1977,7 @@ class SettingsWindow(tk.Toplevel):
         self.app = master
         self.title("Настройки — конфигурации, опции и директории")
         self.configure(bg=BG)
-        self.geometry("900x760")
+        self.geometry("900x860")
         self.minsize(780, 620)
         self.transient(master)
         self.grab_set()
@@ -2032,6 +2078,26 @@ class SettingsWindow(tk.Toplevel):
                    self.var_opt_trim).pack(anchor="w", pady=(2, 0))
         make_check(gui_body, "Титры (внешние субтитры)",
                    self.var_opt_subs).pack(anchor="w", pady=(2, 0))
+
+        queue_opts = make_group(gui_body, "Настройки очереди")
+        queue_opts.pack(fill="x", pady=(6, 0))
+        queue_opts_body = tk.Frame(queue_opts, bg=BG)
+        queue_opts_body.pack(fill="x", padx=8, pady=4)
+
+        self.var_queue_show_times = tk.BooleanVar(
+            value=bool(self.app.queue_show_times_var.get()))
+        self.var_queue_show_sizes = tk.BooleanVar(
+            value=bool(self.app.queue_show_sizes_var.get()))
+        make_check(
+            queue_opts_body,
+            "Отображать время начала-окончания обработки",
+            self.var_queue_show_times,
+        ).pack(anchor="w")
+        make_check(
+            queue_opts_body,
+            "Отображать вес было → стало",
+            self.var_queue_show_sizes,
+        ).pack(anchor="w", pady=(2, 0))
 
         dir_group = make_group(left_col, "Директории")
         dir_group.pack(fill="x", pady=(10, 0))
@@ -2319,7 +2385,10 @@ class SettingsWindow(tk.Toplevel):
         ]
 
         bottom = tk.Frame(self, bg=BG)
-        bottom.pack(fill="x", padx=10, pady=(0, 10))
+        # Нижняя панель должна резервировать место раньше растягиваемого
+        # содержимого, иначе при недостаточной высоте кнопки уезжают за край.
+        bottom.pack(side="bottom", fill="x", padx=10, pady=(0, 10),
+                    before=outer)
         make_button(bottom, "Сохранить", self._save, width=22).pack(side="left")
         make_button(bottom, "Сброс к заводским", self._reset_to_defaults,
                     width=20).pack(side="left", padx=(8, 0))
@@ -2815,6 +2884,8 @@ class SettingsWindow(tk.Toplevel):
         self.var_opt_naming.set(True)
         self.var_opt_trim.set(True)
         self.var_opt_subs.set(True)
+        self.var_queue_show_times.set(True)
+        self.var_queue_show_sizes.set(True)
         self.selected_index = 0
         try:
             save_configs(self.configs, ui_options=self.ui_options)
@@ -2823,6 +2894,8 @@ class SettingsWindow(tk.Toplevel):
             return
         self.app.set_configs(self.configs)
         self.app.set_ui_options(self.ui_options)
+        self.app.set_queue_display_options(True, True)
+        self.app._save_prefs_quiet()
         self._refresh_list()
         if self.configs:
             self._select_index(0)
@@ -2849,6 +2922,9 @@ class SettingsWindow(tk.Toplevel):
         self.app.set_ui_options(ui_options)
         self.app.archive_dir_mode_var.set(archive_mode)
         self.app.archive_root_var.set(archive_root)
+        self.app.set_queue_display_options(
+            bool(self.var_queue_show_times.get()),
+            bool(self.var_queue_show_sizes.get()))
         self.app._save_prefs_quiet()
         return True
 
@@ -3108,6 +3184,7 @@ class TranscodeApp(_BaseTk):
         for status, color in QUEUE_STATUS_COLORS.items():
             self.queue_list.tag_configure(f"q_{status}", foreground=color)
         self.queue_list.tag_configure("q_time", foreground=QUEUE_TIME_FG)
+        self.queue_list.tag_configure("q_size", foreground=QUEUE_SIZE_FG)
         try:
             self.queue_list.tag_raise("sel")
         except tk.TclError:
@@ -3153,11 +3230,8 @@ class TranscodeApp(_BaseTk):
 
         self.queue_show_times_var = tk.BooleanVar(
             value=bool(self.prefs.get("queue_show_times", True)))
-        self.queue_show_times_cb = make_check(
-            qbtns, "Отображать время начала-окончания обработки",
-            self.queue_show_times_var,
-            command=self._on_queue_show_times_toggle)
-        self.queue_show_times_cb.pack(side="left", padx=(12, 0))
+        self.queue_show_sizes_var = tk.BooleanVar(
+            value=bool(self.prefs.get("queue_show_sizes", True)))
 
         self.queue_info_var = tk.StringVar(value="Очередь пуста")
         tk.Label(qbtns, textvariable=self.queue_info_var,
@@ -3517,7 +3591,14 @@ class TranscodeApp(_BaseTk):
                                    wrap="none", cursor="arrow", takefocus=0,
                                    padx=0, pady=0)
         self.status_text.pack(side="left", fill="x", expand=True)
-        self.status_text.tag_configure("green", foreground=GREEN, font=FONT_BOLD)
+        self._status_bold_font = tkfont.Font(
+            family=FONT_UI[0], size=FONT_UI[1], weight="bold")
+        self._status_italic_font = tkfont.Font(
+            family=FONT_UI[0], size=FONT_UI[1], slant="italic")
+        self.status_text.tag_configure(
+            "green", foreground=GREEN, font=self._status_bold_font)
+        self.status_text.tag_configure(
+            "green_italic", foreground=GREEN, font=self._status_italic_font)
         self.status_text.configure(state="disabled")
 
         self.open_loc_btn = make_button(status_row, "Открыть местоположение", self._open_location)
@@ -3580,13 +3661,31 @@ class TranscodeApp(_BaseTk):
                 return False
         return True
 
-    def set_status(self, text: str, highlight: str | None = None):
+    def set_status(self, text: str, highlight: str | None = None,
+                   highlights: list[tuple[str, str]] | None = None):
         self._current_status_text = text
         self._current_status_highlight = highlight
 
         self.status_text.configure(state="normal")
         self.status_text.delete("1.0", "end")
-        if highlight and highlight in text:
+        if highlights:
+            spans = []
+            for fragment, tag in highlights:
+                start = text.find(fragment)
+                if start >= 0:
+                    spans.append((start, start + len(fragment), tag))
+            spans.sort()
+            pos = 0
+            for start, end, tag in spans:
+                if start < pos:
+                    continue
+                if start > pos:
+                    self.status_text.insert("end", text[pos:start])
+                self.status_text.insert("end", text[start:end], tag)
+                pos = end
+            if pos < len(text):
+                self.status_text.insert("end", text[pos:])
+        elif highlight and highlight in text:
             parts = text.split(highlight)
             self.status_text.insert("end", parts[0])
             self.status_text.insert("end", highlight, "green")
@@ -4217,7 +4316,10 @@ class TranscodeApp(_BaseTk):
     # ---------------------------------------------------------- очередь
     def _load_queue_from_disk(self):
         paths = load_queue()
-        self.queue_items = [{"path": p, "status": "waiting"} for p in paths]
+        self.queue_items = [
+            {"path": p, "status": "waiting", "size_before": _file_size(p)}
+            for p in paths
+        ]
         self._queue_refresh_list()
 
     def _queue_paths(self) -> list[str]:
@@ -4241,6 +4343,7 @@ class TranscodeApp(_BaseTk):
             "subs_path": self.subs_path_var.get().strip(),
             "subs_mode": self._subs_mode_key(),
             "queue_show_times": bool(self.queue_show_times_var.get()),
+            "queue_show_sizes": bool(self.queue_show_sizes_var.get()),
             "archive_dir_mode": self.archive_dir_mode_var.get(),
             "archive_root": self.archive_root_var.get(),
         }
@@ -4272,6 +4375,29 @@ class TranscodeApp(_BaseTk):
         ended = str(item.get("ended_at") or "…")
         return f"  [{started}–{ended}]"
 
+    def _queue_size_suffix(self, item: dict) -> str:
+        """Добавка с весом «было → стало», если включено отображение."""
+        var = getattr(self, "queue_show_sizes_var", None)
+        if var is None:
+            return ""
+        try:
+            if not bool(var.get()):
+                return ""
+        except tk.TclError:
+            return ""
+        before = int(item.get("size_before") or 0)
+        after = int(item.get("size_after") or 0)
+        if before <= 0 and after <= 0:
+            return ""
+        before_text = _fmt_size(before) if before > 0 else "—"
+        if after > 0:
+            after_text = _fmt_size(after)
+        elif item.get("status") in ("waiting", "running"):
+            after_text = "…"
+        else:
+            after_text = "—"
+        return f"  [{before_text} → {after_text}]"
+
     def _queue_status_tag(self, status: str) -> str:
         return f"q_{status}" if status in QUEUE_STATUS_COLORS else "q_waiting"
 
@@ -4280,7 +4406,9 @@ class TranscodeApp(_BaseTk):
         label = QUEUE_STATUS_LABELS.get(item.get("status", "waiting"),
                                         item.get("status", "waiting"))
         name = os.path.basename(item.get("path", ""))
-        return f"{index + 1}. [{label}] {name}{self._queue_time_suffix(item)}"
+        return (f"{index + 1}. [{label}] {name}"
+                f"{self._queue_time_suffix(item)}"
+                f"{self._queue_size_suffix(item)}")
 
     def _queue_selected_index(self) -> int | None:
         """Номер выбранного элемента очереди (0-based), если он есть."""
@@ -4342,6 +4470,9 @@ class TranscodeApp(_BaseTk):
             suffix = self._queue_time_suffix(item)
             if suffix:
                 self.queue_list.insert("end", suffix, "q_time")
+            size_suffix = self._queue_size_suffix(item)
+            if size_suffix:
+                self.queue_list.insert("end", size_suffix, "q_size")
             self.queue_list.insert("end", "\n")
         self.queue_list.configure(state="disabled")
         if selected is not None and selected < len(self.queue_items):
@@ -4361,20 +4492,33 @@ class TranscodeApp(_BaseTk):
 
     def _queue_set_status(self, index: int, status: str,
                           started_at: str | None = None,
-                          ended_at: str | None = None):
+                          ended_at: str | None = None,
+                          size_after: int | None = None):
         if 0 <= index < len(self.queue_items):
             item = self.queue_items[index]
             item["status"] = status
+            if status == "running":
+                # Размер пересчитываем непосредственно перед кодированием:
+                # файл могли заменить после добавления в очередь.
+                current = _file_size(str(item.get("path", "")))
+                if current > 0:
+                    item["size_before"] = current
+                item["size_after"] = None
             if started_at is not None:
                 item["started_at"] = started_at
                 item["ended_at"] = None
             if ended_at is not None:
                 item["ended_at"] = ended_at
+            if size_after is not None:
+                item["size_after"] = int(size_after)
             self._queue_refresh_item(index)
 
-    def _on_queue_show_times_toggle(self):
+    def set_queue_display_options(self, show_times: bool,
+                                  show_sizes: bool):
+        """Применяет настройки отображения времени и веса в очереди."""
+        self.queue_show_times_var.set(bool(show_times))
+        self.queue_show_sizes_var.set(bool(show_sizes))
         self._queue_refresh_list()
-        self._save_prefs_quiet()
 
     def _queue_update_path(self, index: int, path: str):
         """Обновляет путь элемента после переноса исходника в old_material."""
@@ -4459,7 +4603,11 @@ class TranscodeApp(_BaseTk):
             if key in existing:
                 continue
             existing.add(key)
-            self.queue_items.append({"path": path, "status": "waiting"})
+            self.queue_items.append({
+                "path": path,
+                "status": "waiting",
+                "size_before": _file_size(path),
+            })
             added += 1
         if added:
             self._queue_refresh_list()
@@ -5228,8 +5376,11 @@ class TranscodeApp(_BaseTk):
                 errors += 1
                 status = "error"
 
+            size_after = (_file_size(job["out"])
+                          if result == "ok" else None)
             self.after(0, self._queue_set_status, index, status, None,
-                       datetime.datetime.now().strftime("%H:%M:%S"))
+                       datetime.datetime.now().strftime("%H:%M:%S"),
+                       size_after)
             self.after(0, self._queue_after_job, job, result,
                        moved_to, move_error)
             if result == "cancel":
@@ -5607,6 +5758,18 @@ class TranscodeApp(_BaseTk):
 
         self._maybe_shutdown()
 
+    def _queue_saved_bytes(self) -> int:
+        """Суммарная экономия веса по успешно завершённым файлам."""
+        saved = 0
+        for item in self.queue_items:
+            if item.get("status") != "done":
+                continue
+            before = int(item.get("size_before") or 0)
+            after = int(item.get("size_after") or 0)
+            if before > 0 and after > 0:
+                saved += before - after
+        return saved
+
     def _finish_queue(self, done: int, errors: int, skipped: int,
                       total: int, cancelled: bool):
         self._running = False
@@ -5638,8 +5801,23 @@ class TranscodeApp(_BaseTk):
                 parts.append(f"{errors} ошибок")
             if skipped:
                 parts.append(f"{skipped} пропущено")
-            self.set_status(" — ".join(parts),
-                            highlight=f"{done} готово" if done else None)
+            saved = self._queue_saved_bytes() if done else 0
+            saved_mb = saved / (1024 * 1024)
+            weight_text = ""
+            if done:
+                if saved > 0:
+                    weight_text = f"вес уменьшился на {saved_mb:.1f} МБ"
+                elif saved < 0:
+                    weight_text = f"вес увеличился на {abs(saved_mb):.1f} МБ"
+                else:
+                    weight_text = "вес не изменился"
+                parts.append(weight_text)
+            highlights = []
+            if done:
+                highlights.append((f"{done} готово", "green"))
+            if weight_text:
+                highlights.append((weight_text, "green_italic"))
+            self.set_status(" - ".join(parts), highlights=highlights)
             if self._last_output and os.path.isfile(self._last_output):
                 self.open_loc_btn.pack(side="right", padx=(8, 0))
             if errors and not done:
